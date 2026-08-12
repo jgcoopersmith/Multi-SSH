@@ -83,6 +83,21 @@ public class AppSettings
     /// <summary>Panel size when docked to the bottom.</summary>
     public double SessionManagerHeight { get; set; } = 200;
 
+    // ---- Main window placement ----
+    // Saved continuously (not just on exit) so an abnormal termination still
+    // reopens where the window was. Null = never saved: use the XAML default,
+    // centred on screen. Values are WPF device-independent units, matching
+    // Window.Left/Top/Width/Height and SystemParameters.VirtualScreen*.
+
+    public double? WindowLeft { get; set; }
+    public double? WindowTop { get; set; }
+    public double? WindowWidth { get; set; }
+    public double? WindowHeight { get; set; }
+
+    /// <summary>True when the window was maximized; the Window* values above then
+    /// hold its restore (un-maximized) bounds.</summary>
+    public bool WindowMaximized { get; set; }
+
     private static readonly string Dir =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Multi-SSH");
     private static readonly string FilePath = Path.Combine(Dir, "settings.json");

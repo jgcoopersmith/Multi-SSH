@@ -6,6 +6,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using MultiSSH.Models;
 using MultiSSH.Services;
 using MultiSSH.Views;
@@ -56,10 +57,123 @@ public partial class MainWindow : Window
         InitializeComponent();
         Title = AppTitle;
         UpdateThemeButton();   // label reflects the theme applied at startup
+        RestorePlacement();
         LoadSaved();
         ApplyDockLayout();
         PreviewKeyDown += Window_PreviewKeyDown;
         Closing += OnClosing;
+        LocationChanged += (_, _) => SchedulePlacementSave();
+        SizeChanged += (_, _) => SchedulePlacementSave();
+        StateChanged += (_, _) => SchedulePlacementSave();
+    }
+
+    // -------------------- window placement --------------------
+
+    // Moving or resizing a window fires a burst of events; coalesce them so we
+    // write settings.json once the user settles rather than on every pixel.
+    private DispatcherTimer? _placementSaveTimer;
+
+    /// <summary>
+    /// Put the window back where it was last seen, provided that rectangle is
+    /// still usable on the current monitor arrangement. Unplugging a second
+    /// monitor (or a resolution change) would otherwise strand the window
+    /// off-screen with no way to drag it back, so we fall back to the XAML
+    /// default (centred) whenever the saved spot isn't reachable.
+    /// </summary>
+    private void RestorePlacement()
+    {
+        var s = AppSettings.Current;
+        if (s.WindowLeft is not double left || s.WindowTop is not double top ||
+            s.WindowWidth is not double width || s.WindowHeight is not double height)
+            return;   // nothing saved yet
+
+        // Guard against a nonsense rectangle (hand-edited or truncated settings)
+        // leaving the window too small to use.
+        if (double.IsNaN(left) || double.IsNaN(top) ||
+            !(width >= 320) || !(height >= 240))
+            return;
+
+        if (!IsReachableOnScreen(new Rect(left, top, width, height))) return;
+
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Left = left;
+        Top = top;
+        Width = width;
+        Height = height;
+        if (s.WindowMaximized) WindowState = WindowState.Maximized;
+    }
+
+    /// <summary>
+    /// True when enough of <paramref name="r"/> lands on a monitor for the user
+    /// to see and grab it. The virtual screen is the bounding box of every
+    /// display, so this also covers multi-monitor setups.
+    /// </summary>
+    private static bool IsReachableOnScreen(Rect r)
+    {
+        var screen = new Rect(
+            SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
+            SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
+
+        var visible = Rect.Intersect(r, screen);
+        if (visible.IsEmpty) return false;
+
+        // The title bar must be on-screen and tall enough to drag: a window
+        // pushed above the top edge can't be moved with the mouse at all.
+        if (r.Top < screen.Top) return false;
+
+        return visible.Width >= 120 && visible.Height >= 40;
+    }
+
+    /// <summary>Copy the current placement into settings (without writing to disk).</summary>
+    private void CapturePlacement()
+    {
+        // Minimized has no meaningful position — keep the last good one.
+        if (WindowState == WindowState.Minimized) return;
+
+        // RestoreBounds is the un-maximized rectangle, which is what we want to
+        // come back to when the user un-maximizes later.
+        var r = WindowState == WindowState.Maximized
+            ? RestoreBounds
+            : new Rect(Left, Top, ActualWidth, ActualHeight);
+
+        if (r.IsEmpty || double.IsNaN(r.Left) || double.IsNaN(r.Top) ||
+            r.Width <= 0 || r.Height <= 0)
+            return;
+
+        var s = AppSettings.Current;
+        s.WindowLeft = r.Left;
+        s.WindowTop = r.Top;
+        s.WindowWidth = r.Width;
+        s.WindowHeight = r.Height;
+        s.WindowMaximized = WindowState == WindowState.Maximized;
+    }
+
+    private void SavePlacementNow()
+    {
+        _placementSaveTimer?.Stop();
+        CapturePlacement();
+        AppSettings.Current.Save();
+    }
+
+    /// <summary>
+    /// Persist the placement shortly after the window settles. Saving as we go
+    /// (rather than only on exit) is what lets a crash or a forced kill still
+    /// reopen in the right place.
+    /// </summary>
+    private void SchedulePlacementSave()
+    {
+        if (!IsLoaded) return;   // ignore the layout churn during startup
+
+        _placementSaveTimer ??= CreatePlacementTimer();
+        _placementSaveTimer.Stop();
+        _placementSaveTimer.Start();
+    }
+
+    private DispatcherTimer CreatePlacementTimer()
+    {
+        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(600) };
+        t.Tick += (_, _) => SavePlacementNow();
+        return t;
     }
 
     // -------------------- keep typing in the terminal --------------------
@@ -1162,6 +1276,9 @@ public partial class MainWindow : Window
 
     private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
+        // Record the final placement before anything can tear the window down.
+        SavePlacementNow();
+
         if (_panes.Count > 0)
         {
             var result = MessageBox.Show(
