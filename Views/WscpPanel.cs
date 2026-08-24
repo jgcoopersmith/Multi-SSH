@@ -31,6 +31,11 @@ public class WscpPanel : Grid
     private bool _connecting;
     private bool _busy;
     private string _connectedStatus = "";
+    /// <summary>Last completed operation's result line (e.g. "Uploaded 3 item(s)"), kept
+    /// visible through the auto-refresh that follows it. Null falls back to the idle line.</summary>
+    private string? _lastResult;
+    /// <summary>Throttle timer for per-file transfer progress updates.</summary>
+    private readonly System.Diagnostics.Stopwatch _progWatch = new();
 
     private readonly ObservableCollection<FsItem> _localItems = new();
     private readonly ObservableCollection<FsItem> _remoteItems = new();
@@ -179,6 +184,10 @@ public class WscpPanel : Grid
     /// <summary>Restore the steady "Connected — user@host" status line.</summary>
     private void StatusIdle() => Emit(ConnectionState.Connected, _connectedStatus);
 
+    /// <summary>Show the last operation's result if one is pending (so a transfer's
+    /// completion notice survives the refresh that follows it), else the idle line.</summary>
+    private void Settle() => Emit(ConnectionState.Connected, _lastResult ?? _connectedStatus);
+
     public void FocusDefault() => (_sftp != null ? _remoteList : _localList).Focus();
 
     public void Shutdown() => DisconnectClient();
@@ -199,11 +208,12 @@ public class WscpPanel : Grid
         if (_sftp == null || !_sftp.IsConnected) { Status("Not connected"); return; }
         if (_busy) return;
         _busy = true;
+        _lastResult = null;
         Status(busyText);
         try
         {
             await Task.Run(work);
-            StatusIdle();
+            Settle();
         }
         catch (Exception ex)
         {
@@ -218,27 +228,31 @@ public class WscpPanel : Grid
 
     // -------------------- remote listing / navigation --------------------
 
-    private void RefreshRemote()
+    private async void RefreshRemote()
     {
-        // Never list while another SFTP operation is in flight: SSH.NET's SftpClient is
-        // not safe for concurrent requests, so a Refresh during a transfer could desync
-        // the channel. An in-flight op refreshes on completion, so skipping here is safe.
-        if (_busy) return;
+        // SSH.NET's SftpClient shares one channel and is not safe for concurrent requests,
+        // so every remote listing is serialised through _busy — the same flag that guards
+        // transfers. Running the listing on a bare thread (as before) let a manual Refresh
+        // overlap another request and wedge the channel, after which Refresh silently did
+        // nothing. A refresh requested while an op is already running is dropped on purpose:
+        // that op refreshes both panes when it finishes.
         var sftp = _sftp;                       // capture: the pane may close and null the field
-        if (sftp == null || !sftp.IsConnected) return;
-        var cwd = _remoteCwd;
-        Task.Run(() =>
+        if (sftp == null || !sftp.IsConnected) { Status("Not connected"); return; }
+        if (_busy) return;
+        _busy = true;
+        Status("Refreshing…");
+        try
         {
-            try
-            {
-                var list = sftp.ListDirectory(cwd).ToList();
-                Dispatcher.Invoke(() => PopulateRemote(list));
-            }
-            catch (Exception ex)
-            {
-                Dispatcher.Invoke(() => Status("Error: " + ex.Message));
-            }
-        });
+            var cwd = _remoteCwd;
+            var list = await Task.Run(() => sftp.ListDirectory(cwd).ToList());
+            PopulateRemote(list);
+            Settle();
+        }
+        catch (Exception ex)
+        {
+            Status("Error: " + ex.Message);
+        }
+        finally { _busy = false; }
     }
 
     private void PopulateRemote(List<ISftpFile> files)
@@ -309,25 +323,31 @@ public class WscpPanel : Grid
         if (items.Count == 0) { Status("Select local files to upload"); return; }
         await DoAsync($"Uploading {items.Count} item(s)…", () =>
         {
-            foreach (var it in items)
-                UploadPath(Path.Combine(_localCwd, it.Name), CombineRemote(_remoteCwd, it.Name));
+            for (int i = 0; i < items.Count; i++)
+                UploadPath(Path.Combine(_localCwd, items[i].Name),
+                    CombineRemote(_remoteCwd, items[i].Name), i + 1, items.Count);
+            _lastResult = $"✔ Uploaded {items.Count} item(s) to {_remoteCwd}";
         });
     }
 
-    private void UploadPath(string localPath, string remotePath)
+    private void UploadPath(string localPath, string remotePath, int idx, int total)
     {
         if (Directory.Exists(localPath))
         {
             EnsureRemoteDir(remotePath);
             foreach (var d in Directory.GetDirectories(localPath))
-                UploadPath(d, CombineRemote(remotePath, Path.GetFileName(d)));
+                UploadPath(d, CombineRemote(remotePath, Path.GetFileName(d)), idx, total);
             foreach (var f in Directory.GetFiles(localPath))
-                UploadPath(f, CombineRemote(remotePath, Path.GetFileName(f)));
+                UploadPath(f, CombineRemote(remotePath, Path.GetFileName(f)), idx, total);
         }
         else
         {
+            long size = new FileInfo(localPath).Length;
+            string name = Path.GetFileName(localPath);
+            _progWatch.Reset();                 // first callback of a new file reports at once
             using var fs = File.OpenRead(localPath);
-            _sftp!.UploadFile(fs, remotePath, canOverride: true);
+            _sftp!.UploadFile(fs, remotePath, canOverride: true,
+                sent => ReportTransfer("Uploading", name, idx, total, sent, size));
         }
     }
 
@@ -343,12 +363,14 @@ public class WscpPanel : Grid
         if (items.Count == 0) { Status("Select remote files to download"); return; }
         await DoAsync($"Downloading {items.Count} item(s)…", () =>
         {
-            foreach (var it in items)
-                DownloadPath(CombineRemote(_remoteCwd, it.Name), Path.Combine(_localCwd, it.Name), it.IsDirectory);
+            for (int i = 0; i < items.Count; i++)
+                DownloadPath(CombineRemote(_remoteCwd, items[i].Name),
+                    Path.Combine(_localCwd, items[i].Name), items[i].IsDirectory, i + 1, items.Count);
+            _lastResult = $"✔ Downloaded {items.Count} item(s) to {_localCwd}";
         });
     }
 
-    private void DownloadPath(string remotePath, string localPath, bool isDir)
+    private void DownloadPath(string remotePath, string localPath, bool isDir, int idx, int total)
     {
         if (isDir)
         {
@@ -356,15 +378,41 @@ public class WscpPanel : Grid
             foreach (var f in _sftp!.ListDirectory(remotePath))
             {
                 if (f.Name is "." or "..") continue;
-                DownloadPath(CombineRemote(remotePath, f.Name), Path.Combine(localPath, f.Name), f.IsDirectory);
+                DownloadPath(CombineRemote(remotePath, f.Name), Path.Combine(localPath, f.Name), f.IsDirectory, idx, total);
             }
         }
         else
         {
+            string name = Path.GetFileName(localPath);
+            long size = 0;
+            try { size = _sftp!.GetAttributes(remotePath).Size; } catch { /* size unknown → show bytes */ }
+            _progWatch.Reset();                 // first callback of a new file reports at once
             using var fs = File.Create(localPath);
-            _sftp!.DownloadFile(remotePath, fs);
+            _sftp!.DownloadFile(remotePath, fs,
+                got => ReportTransfer("Downloading", name, idx, total, got, size));
         }
     }
+
+    /// <summary>Throttled per-file transfer progress on the status strip. Called from the
+    /// SSH.NET transfer thread on each buffer; limited to a few updates a second so the
+    /// dispatcher isn't flooded, but always fires once the file is complete.</summary>
+    private void ReportTransfer(string verb, string name, int idx, int total, ulong done, long size)
+    {
+        bool finished = size <= 0 || (long)done >= size;
+        if (_progWatch.IsRunning && _progWatch.ElapsedMilliseconds < 120 && !finished) return;
+        _progWatch.Restart();
+        string amount = size > 0
+            ? $"{(long)done * 100 / size}%  ({FmtBytes((long)done)} / {FmtBytes(size)})"
+            : FmtBytes((long)done);
+        string count = total > 1 ? $" [{idx}/{total}]" : "";
+        Status($"{verb}{count}  {name} — {amount}");
+    }
+
+    private static string FmtBytes(long b) =>
+        b < 1024 ? $"{b} B" :
+        b < 1024L * 1024 ? $"{b / 1024.0:0.#} KB" :
+        b < 1024L * 1024 * 1024 ? $"{b / 1024.0 / 1024:0.#} MB" :
+        $"{b / 1024.0 / 1024 / 1024:0.#} GB";
 
     // -------------------- file operations (each button says which side it targets) --------------------
 
