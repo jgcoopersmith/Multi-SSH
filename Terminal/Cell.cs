@@ -10,6 +10,15 @@ public enum CellFlags : byte
     Dim       = 1 << 3,
     Italic    = 1 << 4,
     Hidden    = 1 << 5,
+    /// <summary>
+    /// Set on the LAST cell of a line whose text ran off the right edge and
+    /// auto-wrapped onto the next line. Copying a wrapped line must not insert a
+    /// newline, or a long pasted command comes back broken in two. The flag lives
+    /// on the cell (not a parallel array) so it travels with the row when lines are
+    /// shuffled by scrolling, and is cleared automatically when the row is blanked
+    /// or its last column is overwritten.
+    /// </summary>
+    LineWrapped = 1 << 6,
 }
 
 /// <summary>

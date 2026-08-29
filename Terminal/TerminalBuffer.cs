@@ -117,6 +117,9 @@ public class TerminalBuffer
     {
         if (WrapPending && AutoWrap)
         {
+            // Mark the line we are leaving as continued, before LineFeed can push it
+            // into scrollback — otherwise a copied wrapped line gains a stray newline.
+            MarkWrapped(_grid[CursorY]);
             CursorX = 0;
             LineFeed();
             WrapPending = false;
@@ -251,6 +254,15 @@ public class TerminalBuffer
         }
     }
 
+    private static void MarkWrapped(Cell[] line)
+    {
+        if (line.Length > 0) line[^1].Flags |= CellFlags.LineWrapped;
+    }
+
+    /// <summary>True when this row's text continued onto the next row (auto-wrap).</summary>
+    public static bool IsWrapped(Cell[] line)
+        => line.Length > 0 && (line[^1].Flags & CellFlags.LineWrapped) != 0;
+
     private void BlankLine(Cell[] line)
     {
         // Honour the current background (BCE — background-colour erase): a full-screen
@@ -379,8 +391,12 @@ public class TerminalBuffer
             var lineSb = new System.Text.StringBuilder();
             for (int c = from; c <= to && c < line.Length; c++)
                 lineSb.Append(line[c].Char == '\0' ? ' ' : line[c].Char);
-            if (r != endRow) sb.AppendLine(lineSb.ToString().TrimEnd());
-            else sb.Append(lineSb.ToString());
+            // A row that auto-wrapped is the same logical line as the next one: emit it
+            // verbatim with no break and no trim, so a wrapped command pastes back whole.
+            bool wrapped = to == line.Length - 1 && IsWrapped(line);
+            if (r != endRow && !wrapped) sb.AppendLine(lineSb.ToString().TrimEnd());
+            else if (r != endRow) sb.Append(lineSb.ToString());
+            else sb.Append(lineSb.ToString().TrimEnd());
         }
         return sb.ToString();
     }

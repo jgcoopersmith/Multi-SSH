@@ -15,7 +15,8 @@ namespace MultiSSH.Terminal;
 /// <summary>
 /// A self-contained VT100/xterm terminal widget: renders a
 /// <see cref="TerminalBuffer"/> and emits keystrokes via <see cref="Input"/>.
-/// Handles scrollback (mouse wheel), selection→copy and right-click paste.
+/// Handles scrollback (mouse wheel), selection→copy (drag, double-click word,
+/// triple-click line) and paste (right/middle click, Ctrl+Shift+V, Shift+Insert).
 /// </summary>
 public class TerminalControl : Control
 {
@@ -41,8 +42,11 @@ public class TerminalControl : Control
 
     // selection (in "combined" line coordinates: history rows then screen rows)
     private bool _selecting;
+    private bool _selMoved;               // the pointer actually dragged (vs. a bare click)
     private (int row, int col)? _selStart;
     private (int row, int col)? _selEnd;
+    private int _dragScrollDir;           // -1 up, +1 down, 0 none, while drag-selecting
+    private readonly DispatcherTimer _dragScrollTimer;
 
     /// <summary>Raised with the bytes to send to the remote host.</summary>
     public event Action<byte[]>? Input;
@@ -50,8 +54,6 @@ public class TerminalControl : Control
     public event Action<string>? TitleChanged;
     /// <summary>Raised when the visible grid size changes (cols, rows).</summary>
     public event Action<int, int>? GridResized;
-    /// <summary>Raised on a left double-click (used to maximize/restore the pane).</summary>
-    public event Action? DoubleClicked;
 
     private string _lastTitle = "";
 
@@ -86,6 +88,9 @@ public class TerminalControl : Control
         _blinkTimer.Tick += (_, _) => { _cursorOn = !_cursorOn; _dirty = true; };
         _blinkTimer.Start();
 
+        _dragScrollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(60) };
+        _dragScrollTimer.Tick += (_, _) => DragScrollTick();
+
         ContextMenu = BuildContextMenu();
 
         Loaded += (_, _) => Focus();
@@ -95,12 +100,12 @@ public class TerminalControl : Control
     {
         var copy = new MenuItem { Header = "Copy", InputGestureText = "Ctrl+Shift+C" };
         copy.Click += (_, _) => CopySelection();
-        var paste = new MenuItem { Header = "Paste", InputGestureText = "Ctrl+Shift+V" };
+        var paste = new MenuItem { Header = "Paste", InputGestureText = "Ctrl+Shift+V / Shift+Ins" };
         paste.Click += (_, _) => Paste();
         var selectAll = new MenuItem { Header = "Select All" };
         selectAll.Click += (_, _) => SelectAll();
         var clear = new MenuItem { Header = "Clear Selection" };
-        clear.Click += (_, _) => { _selStart = _selEnd = null; _dirty = true; };
+        clear.Click += (_, _) => { _selStart = _selEnd = null; _selMoved = false; _dirty = true; };
 
         var menu = new ContextMenu();
         menu.Items.Add(copy);
@@ -462,25 +467,111 @@ public class TerminalControl : Control
         return (topIndex + r, col);
     }
 
+    /// <summary>Characters that count as part of a "word" for double-click selection.</summary>
+    private static bool IsWordChar(char ch)
+        => char.IsLetterOrDigit(ch) || "_-./~:+@%\\".IndexOf(ch) >= 0;
+
+    /// <summary>Expand a click position to the surrounding word.</summary>
+    private ((int row, int col) start, (int row, int col) end)? WordAt((int row, int col) cell)
+    {
+        int history = _buffer.Scrollback.Count;
+        var line = LineAtCombined(cell.row, history);
+        if (line == null || cell.col >= line.Length) return null;
+
+        char at = line[cell.col].Char;
+        if (at == '\0' || !IsWordChar(at)) return null;
+
+        int s = cell.col, e = cell.col;
+        while (s > 0 && IsWordChar(line[s - 1].Char)) s--;
+        while (e + 1 < line.Length && IsWordChar(line[e + 1].Char)) e++;
+        return ((cell.row, s), (cell.row, e));
+    }
+
+    /// <summary>
+    /// The full logical line at <paramref name="row"/>, following auto-wrap in both
+    /// directions so triple-click grabs a long command as one line, not a screen row.
+    /// </summary>
+    private (int first, int last) LogicalLineRange(int row)
+    {
+        int history = _buffer.Scrollback.Count;
+        int maxRow = history + _buffer.Rows - 1;
+
+        int first = row;
+        while (first > 0)
+        {
+            var prev = LineAtCombined(first - 1, history);
+            if (prev == null || !TerminalBuffer.IsWrapped(prev)) break;
+            first--;
+        }
+
+        int last = row;
+        while (last < maxRow)
+        {
+            var cur = LineAtCombined(last, history);
+            if (cur == null || !TerminalBuffer.IsWrapped(cur)) break;
+            last++;
+        }
+        return (first, last);
+    }
+
     protected override void OnMouseLeftButtonDown(MouseButtonEventArgs e)
     {
         Focus();
 
-        // Double-click anywhere in the terminal enlarges/restores this session.
-        if (e.ClickCount == 2)
+        var cell = PointToCell(e.GetPosition(this));
+
+        // Triple-click selects the whole logical line, double-click the word under
+        // the pointer — the behaviour every other terminal has.
+        if (e.ClickCount >= 3)
         {
+            var (first, last) = LogicalLineRange(cell.row);
+            var lastLine = LineAtCombined(last, _buffer.Scrollback.Count);
+            _selStart = (first, 0);
+            _selEnd = (last, (lastLine?.Length ?? _buffer.Cols) - 1);
             _selecting = false;
+            _selMoved = true;
             if (IsMouseCaptured) ReleaseMouseCapture();
-            _selStart = _selEnd = null;
             _dirty = true;
-            DoubleClicked?.Invoke();
+            if (_cfg.CopyOnSelect) CopySelection();
             e.Handled = true;
             return;
         }
 
+        if (e.ClickCount == 2)
+        {
+            var word = WordAt(cell);
+            _selecting = false;
+            if (IsMouseCaptured) ReleaseMouseCapture();
+            if (word != null)
+            {
+                _selStart = word.Value.start;
+                _selEnd = word.Value.end;
+                _selMoved = true;
+                if (_cfg.CopyOnSelect) CopySelection();
+            }
+            else
+            {
+                _selStart = _selEnd = null;
+                _selMoved = false;
+            }
+            _dirty = true;
+            e.Handled = true;
+            return;
+        }
+
+        // Shift+click extends the existing selection instead of starting a new one.
+        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0 && _selStart != null)
+        {
+            _selEnd = cell;
+            _selMoved = true;
+        }
+        else
+        {
+            _selStart = cell; _selEnd = cell;
+            _selMoved = false;
+        }
+
         _selecting = true;
-        var cell = PointToCell(e.GetPosition(this));
-        _selStart = cell; _selEnd = cell;
         CaptureMouse();
         _dirty = true;
         base.OnMouseLeftButtonDown(e);
@@ -490,10 +581,35 @@ public class TerminalControl : Control
     {
         if (_selecting)
         {
-            _selEnd = PointToCell(e.GetPosition(this));
+            var p = e.GetPosition(this);
+            _selEnd = PointToCell(p);
+            _selMoved = true;
+
+            // Dragging past the top/bottom edge scrolls, so a selection can run past
+            // one screenful instead of stopping dead at the pane border.
+            _dragScrollDir = p.Y < Padding.Top ? -1
+                           : p.Y > ActualHeight - Padding.Bottom ? 1
+                           : 0;
+            if (_dragScrollDir != 0) _dragScrollTimer.Start(); else _dragScrollTimer.Stop();
+
             _dirty = true;
         }
         base.OnMouseMove(e);
+    }
+
+    private void DragScrollTick()
+    {
+        if (!_selecting || _dragScrollDir == 0) { _dragScrollTimer.Stop(); return; }
+
+        int history = _buffer.Scrollback.Count;
+        int before = _scrollOffset;
+        // dir -1 = pointer above the pane => scroll back into history.
+        _scrollOffset = Math.Clamp(_scrollOffset - _dragScrollDir, 0, history);
+        if (_scrollOffset == before) return;
+
+        var p = Mouse.GetPosition(this);
+        _selEnd = PointToCell(new Point(p.X, Math.Clamp(p.Y, Padding.Top, Math.Max(Padding.Top, ActualHeight - Padding.Bottom - 1))));
+        _dirty = true;
     }
 
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
@@ -501,13 +617,45 @@ public class TerminalControl : Control
         if (_selecting)
         {
             _selecting = false;
+            _dragScrollDir = 0;
+            _dragScrollTimer.Stop();
             ReleaseMouseCapture();
-            if (_cfg.CopyOnSelect) CopySelection();
+            // A plain click (no drag) clears the selection rather than copying one cell.
+            if (!_selMoved) _selStart = _selEnd = null;
+            else if (_cfg.CopyOnSelect) CopySelection();
+            _dirty = true;
         }
         base.OnMouseLeftButtonUp(e);
     }
 
-    // Right-click now opens the Copy/Paste context menu (WPF shows it automatically).
+    protected override void OnMouseDown(MouseButtonEventArgs e)
+    {
+        // Middle-click pastes, as it does in PuTTY and every X11 terminal.
+        if (e.ChangedButton == MouseButton.Middle)
+        {
+            Focus();
+            Paste();
+            e.Handled = true;
+            return;
+        }
+        base.OnMouseDown(e);
+    }
+
+    protected override void OnMouseRightButtonUp(MouseButtonEventArgs e)
+    {
+        // "Paste on right-click" is a per-session setting that was never actually
+        // honoured — the context menu always won. Ctrl/Shift+right-click still
+        // opens the menu so Copy/Select All stay reachable.
+        bool wantMenu = (Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Shift)) != 0;
+        if (_cfg.PasteOnRightClick && !wantMenu)
+        {
+            Focus();
+            Paste();
+            e.Handled = true;   // suppresses the ContextMenu for this click
+            return;
+        }
+        base.OnMouseRightButtonUp(e);
+    }
 
     private void CopySelection()
     {
@@ -515,26 +663,66 @@ public class TerminalControl : Control
         var (sr, sc) = _selStart.Value;
         var (er, ec) = _selEnd.Value;
         if (sr > er || (sr == er && sc > ec)) { (sr, sc, er, ec) = (er, ec, sr, sc); }
-        if (sr == er && sc == ec) return;
 
         string text = _buffer.GetText(sr, sc, er, ec, includeScrollback: true);
-        if (!string.IsNullOrEmpty(text))
-        {
-            try { Clipboard.SetText(text); } catch { /* clipboard busy */ }
-        }
+        if (!string.IsNullOrEmpty(text)) SetClipboardText(text);
     }
 
     private void Paste()
     {
-        try
+        string? t = GetClipboardText();
+        if (string.IsNullOrEmpty(t)) return;
+
+        // Terminals expect CR for "Enter"; CRLF/LF would submit a blank extra line.
+        t = t.Replace("\r\n", "\r").Replace("\n", "\r");
+
+        if (_parser.BracketedPaste)
+            t = "\x1b[200~" + t + "\x1b[201~";
+
+        Input?.Invoke(Encoding.UTF8.GetBytes(t));
+        ResetScrollOnKeypress();
+    }
+
+    // The Win32 clipboard is a single shared, lockable resource: any other process
+    // holding it (clipboard managers, RDP, Teams, browsers) makes Set/GetText throw
+    // CLIPBRD_E_CANT_OPEN. Swallowing that silently is what makes copy/paste feel
+    // flaky, so retry briefly instead of dropping the operation on the floor.
+    private const int ClipboardRetries = 8;
+    private const int ClipboardRetryDelayMs = 25;
+
+    private static void SetClipboardText(string text)
+    {
+        for (int attempt = 0; attempt < ClipboardRetries; attempt++)
         {
-            if (Clipboard.ContainsText())
+            try
             {
-                string t = Clipboard.GetText().Replace("\r\n", "\r").Replace("\n", "\r");
-                Input?.Invoke(Encoding.UTF8.GetBytes(t));
+                // copy: true flushes the data to the OS so it survives this app closing.
+                Clipboard.SetDataObject(text, true);
+                return;
             }
+            catch (Exception) when (attempt < ClipboardRetries - 1)
+            {
+                System.Threading.Thread.Sleep(ClipboardRetryDelayMs);
+            }
+            catch { return; }
         }
-        catch { /* clipboard busy */ }
+    }
+
+    private static string? GetClipboardText()
+    {
+        for (int attempt = 0; attempt < ClipboardRetries; attempt++)
+        {
+            try
+            {
+                return Clipboard.ContainsText() ? Clipboard.GetText() : null;
+            }
+            catch (Exception) when (attempt < ClipboardRetries - 1)
+            {
+                System.Threading.Thread.Sleep(ClipboardRetryDelayMs);
+            }
+            catch { return null; }
+        }
+        return null;
     }
 
     // -------------------- scrolling --------------------
@@ -582,8 +770,12 @@ public class TerminalControl : Control
         bool shift = (mods & ModifierKeys.Shift) != 0;
 
         // Copy / paste shortcuts (PuTTY-friendly).
-        if (ctrl && shift && e.Key == Key.C) { CopySelection(); e.Handled = true; return; }
+        // With nothing selected, Ctrl+Shift+C falls through so it can still interrupt.
+        if (ctrl && shift && e.Key == Key.C && HasSelection()) { CopySelection(); e.Handled = true; return; }
         if (ctrl && shift && e.Key == Key.V) { Paste(); e.Handled = true; return; }
+        // Windows-standard clipboard keys.
+        if (shift && !ctrl && e.Key == Key.Insert) { Paste(); e.Handled = true; return; }
+        if (ctrl && !shift && e.Key == Key.Insert) { CopySelection(); e.Handled = true; return; }
 
         // User-configured hot keys: send the mapped command to the shell.
         var pressed = e.Key == Key.System ? e.SystemKey : e.Key; // Alt combos arrive as System

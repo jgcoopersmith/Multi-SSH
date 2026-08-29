@@ -22,6 +22,13 @@ public class AnsiParser
     /// <summary>Application Cursor Keys mode (DECCKM) — affects arrow key encoding.</summary>
     public bool ApplicationCursorKeys { get; private set; }
 
+    /// <summary>
+    /// DECSET 2004. When the remote app asks for bracketed paste, pasted text must be
+    /// wrapped in ESC[200~ … ESC[201~ so editors treat it as data rather than typing —
+    /// without this, pasting into vim/nano triggers auto-indent and mangles the text.
+    /// </summary>
+    public bool BracketedPaste { get; private set; }
+
     public AnsiParser(TerminalBuffer buffer) => _buf = buffer;
 
     public void Feed(byte[] data, int length)
@@ -158,6 +165,7 @@ public class AnsiParser
                 case 1: ApplicationCursorKeys = on; break;   // DECCKM
                 case 7: _buf.AutoWrap = on; break;           // DECAWM
                 case 25: _buf.CursorVisible = on; break;     // DECTCEM
+                case 2004: BracketedPaste = on; break;       // bracketed paste
                 // 1049/47/1047 alternate screen and mouse modes are not modelled;
                 // ignoring them keeps full-screen apps mostly usable.
             }

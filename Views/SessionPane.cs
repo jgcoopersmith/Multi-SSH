@@ -96,8 +96,8 @@ public class SessionPane : Border
 
         session.TitleChanged += _ => _titleText.Text = session.TabTitle;
         session.StateChanged += _ => UpdateStatus();
-        // Double-click the shell body (or the header) to enlarge/restore.
-        session.DoubleClicked += _ => MaximizeToggleRequested?.Invoke(this);
+        // Double-click the header to enlarge/restore. (In the terminal body a
+        // double-click selects a word and a triple-click selects the line.)
         _header.MouseLeftButtonDown += (_, e) =>
         {
             Activated?.Invoke(this);
