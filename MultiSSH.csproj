@@ -10,7 +10,7 @@
     <RootNamespace>MultiSSH</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\multissh.ico</ApplicationIcon>
-    <Version>1.0.53</Version>
+    <Version>1.0.54</Version>
     <Authors>joc00p</Authors>
     <Product>Multi-SSH</Product>
   </PropertyGroup>

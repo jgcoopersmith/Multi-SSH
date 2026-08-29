@@ -43,6 +43,7 @@ public class TerminalControl : Control
     // selection (in "combined" line coordinates: history rows then screen rows)
     private bool _selecting;
     private bool _selMoved;               // the pointer actually dragged (vs. a bare click)
+    private bool _pressed;                // left button went down on us and hasn't come up
     private (int row, int col)? _selStart;
     private (int row, int col)? _selEnd;
     private int _dragScrollDir;           // -1 up, +1 down, 0 none, while drag-selecting
@@ -621,6 +622,7 @@ public class TerminalControl : Control
         }
 
         _selecting = true;
+        _pressed = true;
         CaptureMouse();
         _dirty = true;
         base.OnMouseLeftButtonDown(e);
@@ -628,16 +630,11 @@ public class TerminalControl : Control
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
-        // If the button came up somewhere we never saw (capture stolen, mouse-up
-        // delivered elsewhere), stop dragging — otherwise the selection would keep
-        // tracking a pointer that is no longer pressed.
-        if (_selecting && e.LeftButton != MouseButtonState.Pressed)
-        {
-            EndDrag(copy: true);
-            base.OnMouseMove(e);
-            return;
-        }
-
+        // NOTE: do not try to second-guess the drag here by testing e.LeftButton.
+        // WPF delivers MouseMove for reasons other than physical movement (capture
+        // changes, re-hit-tests after a redraw) and the button state on those can
+        // read as released mid-drag — which silently truncated the selection to the
+        // cell under the anchor. The mouse-up and lost-capture handlers end the drag.
         if (_selecting)
         {
             var p = e.GetPosition(this);
@@ -671,31 +668,36 @@ public class TerminalControl : Control
         _dirty = true;
     }
 
-    /// <summary>Finish a drag-selection, keeping whatever was highlighted.</summary>
-    private void EndDrag(bool copy)
-    {
-        if (!_selecting) return;
-        _selecting = false;
-        _dragScrollDir = 0;
-        _dragScrollTimer.Stop();
-        if (IsMouseCaptured) ReleaseMouseCapture();
-        // A plain click (no drag) clears the selection rather than copying one cell.
-        if (!_selMoved) _selStart = _selEnd = null;
-        else if (copy && _cfg.CopyOnSelect) CopySelection();
-        _dirty = true;
-    }
-
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
     {
-        EndDrag(copy: true);
+        // Keyed off _pressed, not _selecting: releasing capture (just below, or
+        // spontaneously mid-drag) clears _selecting via OnLostMouseCapture, and
+        // gating on it would skip finishing the selection entirely.
+        if (_pressed)
+        {
+            _pressed = false;
+            _selecting = false;
+            _dragScrollDir = 0;
+            _dragScrollTimer.Stop();
+            if (IsMouseCaptured) ReleaseMouseCapture();
+            // A plain click (no drag) clears the selection rather than leaving a
+            // single stray cell highlighted.
+            if (!_selMoved) _selStart = _selEnd = null;
+            else if (_cfg.CopyOnSelect) CopySelection();
+            _dirty = true;
+        }
         base.OnMouseLeftButtonUp(e);
     }
 
     protected override void OnLostMouseCapture(MouseEventArgs e)
     {
-        // Losing capture mid-drag (a re-layout, a Z-order change in layered view)
-        // must end the drag and KEEP the highlight, not leave _selecting stuck on.
-        EndDrag(copy: true);
+        // Capture can be lost mid-drag (a re-layout, or the Z-order change layered
+        // view performs on every click). Stop tracking, but never touch the
+        // selection here: this fires during the normal mouse-up release too, and
+        // discarding the highlight at that point is exactly the bug it caused.
+        _selecting = false;
+        _dragScrollDir = 0;
+        _dragScrollTimer.Stop();
         base.OnLostMouseCapture(e);
     }
 
