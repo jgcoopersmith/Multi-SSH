@@ -47,6 +47,7 @@ public partial class MainWindow : Window
     private TreeViewItem? _insertionHost;
     // Drag-start position for reordering open panes via their tab headers.
     private Point _paneDragStart;
+    private bool _paneDragFromHeader;   // the press that may start a tab reorder began on the header
 
     // Unsubscribe actions for the current tab strip's per-session event handlers.
     // Flushed on every RebuildContent so tab headers don't leak handlers/visuals.
@@ -1070,7 +1071,19 @@ public partial class MainWindow : Window
             pane.Active = false;
             pane.Margin = new Thickness(0);
             var item = new TabItem { Content = pane, Tag = pane, Header = BuildTabHeader(pane), AllowDrop = true };
-            item.PreviewMouseLeftButtonDown += (_, e) => _paneDragStart = e.GetPosition(null);
+            var capturedPane = pane;
+            item.PreviewMouseLeftButtonDown += (_, e) =>
+            {
+                _paneDragStart = e.GetPosition(null);
+                // Only a press on the TAB HEADER may begin a reorder drag. The pane —
+                // and therefore the terminal — is this TabItem's Content and so sits in
+                // its event route. Without this check, selecting text in the terminal
+                // starts a drag-and-drop after ~4px (MinimumHorizontalDragDistance,
+                // narrower than one character cell): the modal drag loop takes mouse
+                // capture away from the terminal and the selection freezes on the cell
+                // it started from.
+                _paneDragFromHeader = !IsInSubtree(e.OriginalSource as DependencyObject, capturedPane);
+            };
             item.PreviewMouseMove += TabItem_PreviewMouseMove;
             item.DragOver += TabItem_DragOver;
             item.Drop += TabItem_Drop;
@@ -1141,8 +1154,24 @@ public partial class MainWindow : Window
 
     // ---- drag a tab to reorder the open sessions ----
 
+    /// <summary>True when <paramref name="node"/> is <paramref name="ancestor"/> or sits under it.</summary>
+    private static bool IsInSubtree(DependencyObject node, DependencyObject ancestor)
+    {
+        while (node != null)
+        {
+            if (ReferenceEquals(node, ancestor)) return true;
+            node = node is Visual or System.Windows.Media.Media3D.Visual3D
+                ? VisualTreeHelper.GetParent(node)
+                : LogicalTreeHelper.GetParent(node);
+        }
+        return false;
+    }
+
     private void TabItem_PreviewMouseMove(object sender, MouseEventArgs e)
     {
+        // A drag that began inside the tab's content (the terminal) is a text
+        // selection, not a tab reorder — never hijack it.
+        if (!_paneDragFromHeader) return;
         if (e.LeftButton != MouseButtonState.Pressed) return;
         if (sender is not TabItem { Tag: SessionPane pane } ti) return;
         var p = e.GetPosition(null);

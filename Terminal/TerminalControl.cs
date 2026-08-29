@@ -714,13 +714,14 @@ public class TerminalControl : Control
         base.OnMouseDown(e);
     }
 
+    // Right-click opens the Copy/Paste context menu (WPF shows it automatically).
+    // It deliberately does NOT paste: silently pasting on right-click sends text
+    // straight into the live session, and it takes away the menu that Copy,
+    // Select All and Clear Selection live on. Shift+right-click pastes for anyone
+    // who wants the PuTTY gesture.
     protected override void OnMouseRightButtonUp(MouseButtonEventArgs e)
     {
-        // "Paste on right-click" is a per-session setting that was never actually
-        // honoured — the context menu always won. Ctrl/Shift+right-click still
-        // opens the menu so Copy/Select All stay reachable.
-        bool wantMenu = (Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Shift)) != 0;
-        if (_cfg.PasteOnRightClick && !wantMenu)
+        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0)
         {
             Focus();
             Paste();
