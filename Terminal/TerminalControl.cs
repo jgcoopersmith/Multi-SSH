@@ -47,6 +47,7 @@ public class TerminalControl : Control
     private (int row, int col)? _selEnd;
     private int _dragScrollDir;           // -1 up, +1 down, 0 none, while drag-selecting
     private readonly DispatcherTimer _dragScrollTimer;
+    private long _lastTrimmed;            // buffer.TrimmedLines as of the last frame
 
     /// <summary>Raised with the bytes to send to the remote host.</summary>
     public event Action<byte[]>? Input;
@@ -79,6 +80,7 @@ public class TerminalControl : Control
         _renderTimer.Tick += (_, _) =>
         {
             DrainIncoming();
+            SyncToTrimmedScrollback();
             if (_dirty) { _dirty = false; InvalidateVisual(); }
             PublishTitle();
         };
@@ -119,6 +121,53 @@ public class TerminalControl : Control
             try { paste.IsEnabled = Clipboard.ContainsText(); } catch { paste.IsEnabled = true; }
         };
         return menu;
+    }
+
+    /// <summary>
+    /// Once the scrollback is full, every new line of output discards the oldest one,
+    /// which renumbers every row. Row indices held by the selection and by the scroll
+    /// position must move with it — otherwise a highlight slides up through the text
+    /// one row per line of output and then vanishes off the top, and a scrolled-back
+    /// view creeps forward on its own.
+    /// </summary>
+    private void SyncToTrimmedScrollback()
+    {
+        long trimmed = _buffer.TrimmedLines;
+        int delta = (int)Math.Min(trimmed - _lastTrimmed, int.MaxValue);
+        _lastTrimmed = trimmed;
+        if (delta <= 0) return;
+
+        // Only when scrolled back: at the bottom (_scrollOffset == 0) the view should
+        // keep following live output rather than staying pinned to old content.
+        if (_scrollOffset > 0)
+        {
+            _scrollOffset = Math.Clamp(_scrollOffset + delta, 0, _buffer.Scrollback.Count);
+            _dirty = true;
+        }
+
+        if (_selStart == null || _selEnd == null) return;
+
+        var s = _selStart.Value;
+        var e = _selEnd.Value;
+        s.row -= delta;
+        e.row -= delta;
+
+        // Both ends scrolled out of history entirely — the selection is gone.
+        if (s.row < 0 && e.row < 0)
+        {
+            _selStart = _selEnd = null;
+            _selMoved = false;
+            _dirty = true;
+            return;
+        }
+
+        // Partly trimmed: clamp the surviving end to the top of what's left.
+        if (s.row < 0) { s.row = 0; s.col = 0; }
+        if (e.row < 0) { e.row = 0; e.col = 0; }
+
+        _selStart = s;
+        _selEnd = e;
+        _dirty = true;
     }
 
     private bool HasSelection()
@@ -579,6 +628,16 @@ public class TerminalControl : Control
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
+        // If the button came up somewhere we never saw (capture stolen, mouse-up
+        // delivered elsewhere), stop dragging — otherwise the selection would keep
+        // tracking a pointer that is no longer pressed.
+        if (_selecting && e.LeftButton != MouseButtonState.Pressed)
+        {
+            EndDrag(copy: true);
+            base.OnMouseMove(e);
+            return;
+        }
+
         if (_selecting)
         {
             var p = e.GetPosition(this);
@@ -612,20 +671,32 @@ public class TerminalControl : Control
         _dirty = true;
     }
 
+    /// <summary>Finish a drag-selection, keeping whatever was highlighted.</summary>
+    private void EndDrag(bool copy)
+    {
+        if (!_selecting) return;
+        _selecting = false;
+        _dragScrollDir = 0;
+        _dragScrollTimer.Stop();
+        if (IsMouseCaptured) ReleaseMouseCapture();
+        // A plain click (no drag) clears the selection rather than copying one cell.
+        if (!_selMoved) _selStart = _selEnd = null;
+        else if (copy && _cfg.CopyOnSelect) CopySelection();
+        _dirty = true;
+    }
+
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
     {
-        if (_selecting)
-        {
-            _selecting = false;
-            _dragScrollDir = 0;
-            _dragScrollTimer.Stop();
-            ReleaseMouseCapture();
-            // A plain click (no drag) clears the selection rather than copying one cell.
-            if (!_selMoved) _selStart = _selEnd = null;
-            else if (_cfg.CopyOnSelect) CopySelection();
-            _dirty = true;
-        }
+        EndDrag(copy: true);
         base.OnMouseLeftButtonUp(e);
+    }
+
+    protected override void OnLostMouseCapture(MouseEventArgs e)
+    {
+        // Losing capture mid-drag (a re-layout, a Z-order change in layered view)
+        // must end the drag and KEEP the highlight, not leave _selecting stuck on.
+        EndDrag(copy: true);
+        base.OnLostMouseCapture(e);
     }
 
     protected override void OnMouseDown(MouseButtonEventArgs e)

@@ -34,6 +34,15 @@ public class TerminalBuffer
     private CellFlags _savedFlags;
 
     public string Title { get; set; } = "";
+
+    /// <summary>
+    /// How many lines have been discarded off the front of the scrollback because it
+    /// hit <see cref="MaxScrollback"/>. Row indices are relative to the start of
+    /// history, so each trim shifts every existing row down by one; callers that
+    /// cached a row index subtract the growth in this counter to stay on the same text.
+    /// </summary>
+    public long TrimmedLines { get; private set; }
+
     public bool WrapPending { get; private set; }
     public bool AutoWrap { get; set; } = true;
 
@@ -230,7 +239,13 @@ public class TerminalBuffer
                 Array.Copy(_grid[0], snapshot, Cols);
                 _scrollback.Add(snapshot);
                 if (_scrollback.Count > MaxScrollback)
+                {
                     _scrollback.RemoveAt(0);
+                    // Dropping the oldest history line renumbers every row below it.
+                    // Anything holding a row index (a live selection, the scroll
+                    // position) has to be told, or it silently points at other text.
+                    TrimmedLines++;
+                }
             }
 
             var recycled = _grid[_scrollTop];

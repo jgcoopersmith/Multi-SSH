@@ -5,7 +5,7 @@
 ; The published self-contained exe must exist first (see build-installer.ps1).
 
 #define AppName "Multi-SSH"
-#define AppVersion "1.0.52"
+#define AppVersion "1.0.53"
 #define AppPublisher "joc00p"
 #define AppExe "Multi-SSH.exe"
 #define AppUrl "https://github.com/joc00p/Multi-SSH"
