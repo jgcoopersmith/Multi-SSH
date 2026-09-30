@@ -1,0 +1,25 @@
+﻿{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "allow": [
+      "Bash(ollama list)",
+      "Bash(ollama list *)",
+      "Bash(ollama --version)",
+      "Bash(ollama show *)",
+      "Bash(gh repo list *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-Content *)",
+      "PowerShell(ollama list*)",
+      "PowerShell(ollama --version*)",
+      "PowerShell(gh repo list*)",
+      "PowerShell(gh --version*)",
+      "PowerShell(git --version*)",
+      "mcp__Claude_Browser__computer",
+      "mcp__Claude_Browser__navigate",
+      "mcp__ccd_session__mark_chapter",
+      "mcp__visualize__show_widget",
+      "mcp__mcp-registry__search_mcp_registry",
+      "mcp__Claude_Browser__read_page"
+    ]
+  }
+}
