@@ -30,6 +30,8 @@ public abstract class InteractivePromptBackend : ITerminalBackend
     private readonly char[] _inChars = new char[2];
     private Thread? _worker;
     private volatile bool _disposed;
+    private readonly object _life = new();
+    private bool _connectInFlight;   // guarded by _life
     private bool _connected;
 
     protected InteractivePromptBackend(SessionConfig cfg) => Cfg = cfg;
@@ -50,10 +52,25 @@ public abstract class InteractivePromptBackend : ITerminalBackend
     public async Task ConnectAsync(int cols, int rows)
     {
         StatusChanged?.Invoke($"Connecting to {Cfg.Host}:{Cfg.Port} …");
-        await Task.Run(ConnectClient);   // exceptions bubble to the connect loop
-        if (_disposed)
+        lock (_life)
         {
-            // Closed while connecting: Dispose may have run before the client existed.
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _connectInFlight = true;
+        }
+
+        // Dispose leaves the client alone while ConnectClient runs — tearing an SSH.NET client
+        // down mid-Connect leaks the session it is still building — so clean it up here instead.
+        bool disposed;
+        try { await Task.Run(ConnectClient); }   // exceptions bubble to the connect loop
+        catch
+        {
+            lock (_life) { _connectInFlight = false; disposed = _disposed; }
+            if (disposed) { try { DisposeClient(); } catch { /* best effort */ } }
+            throw;
+        }
+        lock (_life) { _connectInFlight = false; disposed = _disposed; }
+        if (disposed)
+        {
             try { DisposeClient(); } catch { /* best effort */ }
             throw new ObjectDisposedException(GetType().Name);
         }
@@ -170,8 +187,13 @@ public abstract class InteractivePromptBackend : ITerminalBackend
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        bool clientConnecting;
+        lock (_life)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            clientConnecting = _connectInFlight;   // ConnectAsync disposes it when ConnectClient returns
+        }
         _connected = false;
         try { _queue.CompleteAdding(); } catch { }
 
@@ -185,7 +207,7 @@ public abstract class InteractivePromptBackend : ITerminalBackend
         Task.Run(() =>
         {
             try { worker?.Join(TimeSpan.FromSeconds(30)); } catch { }
-            try { DisposeClient(); } catch { }
+            if (!clientConnecting) { try { DisposeClient(); } catch { } }
             try { _queue.Dispose(); } catch { }
         });
 

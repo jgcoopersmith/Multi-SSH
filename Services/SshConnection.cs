@@ -19,6 +19,9 @@ public class SshConnection : ITerminalBackend
     private Thread? _readThread;
     private volatile bool _disposed;
     private volatile bool _connectionError;
+    private int _lostRaised;
+    private readonly object _life = new();
+    private bool _connectInFlight;   // guarded by _life
 
     public event Action<byte[]>? DataReceived;
     public event Action<string>? StatusChanged;
@@ -37,24 +40,35 @@ public class SshConnection : ITerminalBackend
         // Build the connection info off the UI thread — resolving a forced IPv4/IPv6
         // host does a DNS lookup, which we don't want to block the UI with.
         var info = await Task.Run(() => RemoteAuth.BuildConnectionInfo(_cfg));
-        // Disposed while resolving (tab closed): don't open a connection nobody will close.
-        ObjectDisposedException.ThrowIf(_disposed, this);
 
         var client = new SshClient(info);
-        _client = client;
         client.KeepAliveInterval = _cfg.KeepAliveSeconds > 0
             ? TimeSpan.FromSeconds(_cfg.KeepAliveSeconds)
             : Timeout.InfiniteTimeSpan;
-        client.ErrorOccurred += (_, e) =>
-        {
-            _connectionError = true;
-            StatusChanged?.Invoke("Error: " + e.Exception.Message);
-        };
+        client.ErrorOccurred += (_, e) => ConnectionLost(e.Exception.Message);
 
-        await Task.Run(() => client.Connect());
-        if (_disposed)
+        lock (_life)
         {
-            try { client.Dispose(); } catch { /* already torn down */ }
+            // Disposed while resolving (tab closed): don't open a connection nobody will close.
+            if (_disposed) { client.Dispose(); throw new ObjectDisposedException(nameof(SshConnection)); }
+            _client = client;
+            _connectInFlight = true;
+        }
+
+        // Dispose leaves the client alone while Connect runs — tearing an SSH.NET client down
+        // mid-Connect leaks the session it is still building — so clean it up here instead.
+        bool disposed;
+        try { await Task.Run(() => client.Connect()); }
+        catch
+        {
+            lock (_life) { _connectInFlight = false; disposed = _disposed; }
+            if (disposed) DisposeQuietly(client);
+            throw;
+        }
+        lock (_life) { _connectInFlight = false; disposed = _disposed; }
+        if (disposed)
+        {
+            DisposeQuietly(client);
             throw new ObjectDisposedException(nameof(SshConnection));
         }
         RemoteAuth.ApplySocketOptions(client, _cfg);   // TCP_NODELAY / SO_KEEPALIVE
@@ -68,11 +82,7 @@ public class SshConnection : ITerminalBackend
             (uint)(cols * 8), (uint)(rows * 16),
             8192, modes);
 
-        _shell.ErrorOccurred += (_, e) =>
-        {
-            _connectionError = true;
-            StatusChanged?.Invoke("Shell error: " + e.Exception.Message);
-        };
+        _shell.ErrorOccurred += (_, e) => ConnectionLost(e.Exception.Message);
 
         // Read on a background thread: a blocking Read returns 0 at EOF when the
         // remote shell exits, which lets us tear the window down automatically.
@@ -119,12 +129,30 @@ public class SshConnection : ITerminalBackend
                     }
                     else
                     {
-                        Closed?.Invoke("Connection lost" + (failure != null ? ": " + failure : ""));
+                        ConnectionLost(failure);
                     }
                 }
             }
             catch { /* disposed concurrently — the pane is closing anyway */ }
         }
+    }
+
+    /// <summary>Report a dead session once, and wake the read thread.</summary>
+    private void ConnectionLost(string? reason)
+    {
+        _connectionError = true;
+        if (_disposed || Interlocked.Exchange(ref _lostRaised, 1) != 0) return;
+        Closed?.Invoke("Connection lost" + (string.IsNullOrEmpty(reason) ? "" : ": " + reason));
+        // SSH.NET never completes a pending ShellStream.Read when the session dies, so the
+        // read thread would hang forever; disposing the stream wakes it. Off this thread —
+        // this is SSH.NET's message-listener thread, and a channel close waits on it.
+        var shell = _shell;
+        if (shell != null) Task.Run(() => { try { shell.Dispose(); } catch { } });
+    }
+
+    private static void DisposeQuietly(SshClient client)
+    {
+        try { client.Dispose(); } catch { /* best effort */ }
     }
 
     public void Send(byte[] data)
@@ -170,13 +198,21 @@ public class SshConnection : ITerminalBackend
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        bool clientConnecting;
+        lock (_life)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            clientConnecting = _connectInFlight;   // ConnectAsync disposes it when Connect returns
+        }
         try
         {
             _shell?.Dispose();   // unblocks the read loop
-            _client?.Disconnect();
-            _client?.Dispose();
+            if (!clientConnecting)
+            {
+                _client?.Disconnect();
+                _client?.Dispose();
+            }
         }
         catch { /* ignore teardown errors */ }
         finally
