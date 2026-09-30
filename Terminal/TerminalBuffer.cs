@@ -313,6 +313,8 @@ public class TerminalBuffer
                 for (int r = 0; r < Rows; r++) BlankLine(_grid[r]);
                 break;
             case 3:
+                // Clearing history renumbers every row, same as trimming it one line at a time.
+                TrimmedLines += _scrollback.Count;
                 _scrollback.Clear();
                 for (int r = 0; r < Rows; r++) BlankLine(_grid[r]);
                 break;

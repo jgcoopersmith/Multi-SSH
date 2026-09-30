@@ -103,21 +103,27 @@ public class SshConnection : ITerminalBackend
         }
         finally
         {
-            if (!_disposed)
+            // Nothing may escape this background thread — an unhandled exception here would
+            // terminate the whole app (e.g. IsConnected throws if Dispose runs concurrently).
+            try
             {
-                // Only a clean EOF on a still-live session means the remote shell exited
-                // (which closes the pane). A dropped link keeps the pane so the user keeps
-                // the scrollback and can Reconnect.
-                if (failure == null && !_connectionError && (client?.IsConnected ?? false))
+                if (!_disposed)
                 {
-                    StatusChanged?.Invoke("Shell closed");
-                    ShellExited?.Invoke();
-                }
-                else
-                {
-                    Closed?.Invoke("Connection lost" + (failure != null ? ": " + failure : ""));
+                    // Only a clean EOF on a still-live session means the remote shell exited
+                    // (which closes the pane). A dropped link keeps the pane so the user keeps
+                    // the scrollback and can Reconnect.
+                    if (failure == null && !_connectionError && (client?.IsConnected ?? false))
+                    {
+                        StatusChanged?.Invoke("Shell closed");
+                        ShellExited?.Invoke();
+                    }
+                    else
+                    {
+                        Closed?.Invoke("Connection lost" + (failure != null ? ": " + failure : ""));
+                    }
                 }
             }
+            catch { /* disposed concurrently — the pane is closing anyway */ }
         }
     }
 

@@ -148,12 +148,15 @@ public class WscpPanel : Grid
                 _remoteCwd = _sftp!.WorkingDirectory;
                 _connectedStatus = $"Connected — {_cfg.Username}@{_cfg.Host}";
                 Emit(ConnectionState.Connected, _connectedStatus);
-                RefreshRemote();
+                // Wait rather than skip: a listing or operation on the previous client may
+                // still hold the gate, and skipping would leave its stale listing on screen.
+                RefreshRemote(waitForGate: true);
                 return;
             }
             catch (SshAuthenticationException ex)
             {
                 client?.Dispose();
+                if (_shutdown) return;   // pane closed while connecting — no prompts for it
                 if (!UsesPassword(_cfg.Auth) || attempt >= MaxAuthAttempts) { Fail(ex.Message); return; }
                 var pw = PromptSecret($"Password for {_cfg.Username}@{_cfg.Host}",
                     $"{_cfg.Host} : {_cfg.Port}", $"Authentication failed: {ex.Message}");
@@ -163,6 +166,7 @@ public class WscpPanel : Grid
             catch (KeyPassphraseRequiredException ex)
             {
                 client?.Dispose();
+                if (_shutdown) return;
                 if (attempt >= MaxAuthAttempts) { Fail(ex.Message); return; }
                 string? error = string.IsNullOrEmpty(_cfg.KeyPassphrase) ? null : ex.Message;
                 var pass = PromptSecret("Passphrase for the private key", _cfg.PrivateKeyPath ?? "", error);
@@ -172,7 +176,7 @@ public class WscpPanel : Grid
             catch (Exception ex)
             {
                 client?.Dispose();
-                Fail(ex.Message);
+                if (!_shutdown) Fail(ex.Message);
                 return;
             }
         }
@@ -277,18 +281,20 @@ public class WscpPanel : Grid
 
     // -------------------- remote listing / navigation --------------------
 
-    private async void RefreshRemote()
+    private async void RefreshRemote(bool waitForGate = false)
     {
         // SSH.NET's SftpClient shares one channel and is not safe for concurrent requests,
         // so every remote listing is serialised through _gate — the same lock that guards
-        // operations. A refresh requested while an op is already running is dropped on
+        // operations. A plain refresh requested while an op is already running is dropped on
         // purpose: that op refreshes both panes when it finishes.
-        var sftp = _sftp;                       // capture: the pane may close and null the field
-        if (sftp == null || !sftp.IsConnected) { Status("Not connected"); return; }
-        if (!_gate.Wait(0)) return;
-        Status("Refreshing…");
+        if (_sftp == null || !_sftp.IsConnected) { Status("Not connected"); return; }
+        if (waitForGate) await _gate.WaitAsync();
+        else if (!_gate.Wait(0)) return;
         try
         {
+            var sftp = _sftp;                   // capture: the pane may close and null the field
+            if (sftp == null || !sftp.IsConnected) { Status("Not connected"); return; }
+            Status("Refreshing…");
             var cwd = _remoteCwd;
             var list = await Task.Run(() => sftp.ListDirectory(cwd).ToList());
             PopulateRemote(list);

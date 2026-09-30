@@ -51,39 +51,54 @@ public class Recorder : IDisposable
         {
             if (_writer == null || data.Length == 0) return;
 
-            var chars = new char[data.Length * 2];
-            int n = _decoder.GetChars(data, 0, data.Length, chars, 0);
-            _pending += new string(chars, 0, n);
+            try
+            {
+                var chars = new char[data.Length * 2];
+                int n = _decoder.GetChars(data, 0, data.Length, chars, 0);
+                _pending += new string(chars, 0, n);
 
-            // Hold back a trailing, still-incomplete escape sequence until more arrives.
-            int cut = _pending.Length;
-            int esc = _pending.LastIndexOf('\x1b');
-            if (esc >= 0 && !CompleteEscapeAtStart(_pending.Substring(esc)))
-                cut = esc;
+                // Hold back a trailing, still-incomplete escape sequence until more arrives.
+                int cut = _pending.Length;
+                int esc = _pending.LastIndexOf('\x1b');
+                if (esc >= 0 && !CompleteEscapeAtStart(_pending.Substring(esc)))
+                    cut = esc;
 
-            var chunk = _pending.Substring(0, cut);
-            _pending = _pending.Substring(cut);
+                var chunk = _pending.Substring(0, cut);
+                _pending = _pending.Substring(cut);
 
-            _writer.Write(AnsiStripper.Clean(chunk));
+                _writer.Write(AnsiStripper.Clean(chunk));
+            }
+            catch
+            {
+                // Disk full, or the recordings folder (e.g. a network share) went away. This
+                // runs on the connection's read thread, so throwing would end the session's
+                // output — stop recording instead and keep the session alive.
+                CloseWriter();
+            }
         }
     }
 
     public void Stop()
     {
-        lock (_lock)
-        {
-            if (_writer == null) return;
-            try { _writer.Write(AnsiStripper.Clean(_pending)); _writer.Flush(); _writer.Dispose(); }
-            catch { /* best effort */ }
-            _writer = null;
-            _pending = "";
-        }
+        lock (_lock) CloseWriter();
+    }
+
+    private void CloseWriter()
+    {
+        if (_writer == null) return;
+        try { _writer.Write(AnsiStripper.Clean(_pending)); _writer.Flush(); _writer.Dispose(); }
+        catch { /* best effort */ }
+        _writer = null;
+        _pending = "";
     }
 
     public void Dispose() => Stop();
 
+    // Complete forms: CSI, OSC, a charset designator (ESC ( B), or any other two-byte
+    // escape (ESC 7, ESC 8, ESC =, ESC >, ESC M …). Missing one of these made the recorder
+    // hold every later byte back until another escape arrived.
     private static readonly Regex EscAtStart = new(
-        @"^\x1B(\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(\x07|\x1B\\)|[@-Z\\-_])",
+        @"^\x1B(\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(\x07|\x1B\\)|[()*+#].|[0-~-[\[\]]])",
         RegexOptions.Compiled);
 
     private static bool CompleteEscapeAtStart(string tail) => EscAtStart.IsMatch(tail);
@@ -102,7 +117,7 @@ public static class AnsiStripper
 {
     private static readonly Regex Osc = new(@"\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)", RegexOptions.Compiled);
     private static readonly Regex Csi = new(@"\x1B\[[0-?]*[ -/]*[@-~]", RegexOptions.Compiled);
-    private static readonly Regex OtherEsc = new(@"\x1B[@-Z\\-_]", RegexOptions.Compiled);
+    private static readonly Regex OtherEsc = new(@"\x1B(?:[()*+#].|[0-~])", RegexOptions.Compiled);
 
     public static string Clean(string s)
     {

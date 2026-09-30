@@ -49,6 +49,7 @@ public class TerminalControl : Control
     private int _dragScrollDir;           // -1 up, +1 down, 0 none, while drag-selecting
     private readonly DispatcherTimer _dragScrollTimer;
     private long _lastTrimmed;            // buffer.TrimmedLines as of the last frame
+    private int _lastHistory;             // buffer.Scrollback.Count as of the last frame
 
     /// <summary>Raised with the bytes to send to the remote host.</summary>
     public event Action<byte[]>? Input;
@@ -136,15 +137,19 @@ public class TerminalControl : Control
         long trimmed = _buffer.TrimmedLines;
         int delta = (int)Math.Min(trimmed - _lastTrimmed, int.MaxValue);
         _lastTrimmed = trimmed;
-        if (delta <= 0) return;
+        int history = _buffer.Scrollback.Count;
+        int grown = history - _lastHistory;
+        _lastHistory = history;
 
-        // Only when scrolled back: at the bottom (_scrollOffset == 0) the view should
-        // keep following live output rather than staying pinned to old content.
-        if (_scrollOffset > 0)
+        // While scrolled back, every line that entered history — growing the list, or
+        // replacing a trimmed one — would move the view; shift by the same amount so it stays
+        // on the text being read. At the bottom (_scrollOffset == 0) it follows live output.
+        if (_scrollOffset > 0 && delta + grown != 0)
         {
-            _scrollOffset = Math.Clamp(_scrollOffset + delta, 0, _buffer.Scrollback.Count);
+            _scrollOffset = Math.Clamp(_scrollOffset + delta + grown, 0, history);
             _dirty = true;
         }
+        if (delta <= 0) return;
 
         if (_selStart == null || _selEnd == null) return;
 

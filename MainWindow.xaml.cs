@@ -1155,7 +1155,7 @@ public partial class MainWindow : Window
     // ---- drag a tab to reorder the open sessions ----
 
     /// <summary>True when <paramref name="node"/> is <paramref name="ancestor"/> or sits under it.</summary>
-    private static bool IsInSubtree(DependencyObject node, DependencyObject ancestor)
+    private static bool IsInSubtree(DependencyObject? node, DependencyObject ancestor)
     {
         while (node != null)
         {
