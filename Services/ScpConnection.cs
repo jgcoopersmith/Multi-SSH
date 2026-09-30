@@ -62,7 +62,7 @@ public class ScpConnection : InteractivePromptBackend
         var remote = args[0];
         var localName = args.Count > 1 ? args[1] : Path.GetFileName(remote.TrimEnd('/'));
         var localPath = Path.IsPathRooted(localName) ? localName : Path.Combine(LocalDir, localName);
-        _scp!.Download(remote, new FileInfo(localPath));
+        LocalFile.WriteViaTemp(localPath, tmp => _scp!.Download(remote, new FileInfo(tmp)));
         Line($"downloaded {remote} -> {localPath} ({new FileInfo(localPath).Length} bytes)");
     }
 

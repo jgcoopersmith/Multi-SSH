@@ -26,10 +26,11 @@ public class SessionView : Grid
     private readonly TextBlock _status;
     private readonly TextBlock _position;
     private readonly Border _statusBar;
-    private ITerminalBackend? _conn;
+    private volatile ITerminalBackend? _conn;   // read by backend threads to drop stale events
     private bool _connected;
     private bool _pendingConnect = true;
     private bool _connecting;   // guards against overlapping connect/reconnect attempts
+    private bool _closed;
     // Written on the UI thread (via SetState's Dispatcher call) but read from backend
     // read/wait threads in the Closed handler, so mark it volatile to avoid a stale read.
     private volatile ConnectionState _state = ConnectionState.Idle;
@@ -247,15 +248,20 @@ public class SessionView : Grid
 
             try
             {
-                await _conn.ConnectAsync(cols, rows);
+                await backend.ConnectAsync(cols, rows);
+                if (_closed) return;
+                // The pane may have been resized while connecting (layout rebuilt, password
+                // prompt open); those resizes were dropped because there was no PTY yet.
+                if (_term!.Buffer.Cols != cols || _term.Buffer.Rows != rows)
+                    backend.Resize(_term.Buffer.Cols, _term.Buffer.Rows);
                 SetState(ConnectionState.Connected, $"Connected — {_cfg.Username}@{_cfg.Host}");
-                _term!.Feed(Enc($"\x1b[32m*** Connected to {_cfg.Host} ***\x1b[0m\r\n"));
+                _term.Feed(Enc($"\x1b[32m*** Connected to {_cfg.Host} ***\x1b[0m\r\n"));
                 return;
             }
             catch (SshAuthenticationException ex)
             {
-                _conn.Dispose();
-                _conn = null;
+                DropBackend(backend);
+                if (_closed) return;
 
                 // Re-prompt on rejection (wrong or empty password), up to a limit.
                 if (!UsesPassword(_cfg.Auth) || attempt >= MaxAuthAttempts)
@@ -271,8 +277,8 @@ public class SessionView : Grid
             }
             catch (KeyPassphraseRequiredException ex)
             {
-                _conn.Dispose();
-                _conn = null;
+                DropBackend(backend);
+                if (_closed) return;
 
                 if (attempt >= MaxAuthAttempts) { Fail(ex.Message); return; }
 
@@ -285,12 +291,18 @@ public class SessionView : Grid
             }
             catch (Exception ex)
             {
-                _conn?.Dispose();
-                _conn = null;
-                Fail(ex.Message);
+                DropBackend(backend);
+                if (!_closed) Fail(ex.Message);
                 return;
             }
         }
+    }
+
+    /// <summary>Dispose a backend whose connect attempt failed, and forget it if it's current.</summary>
+    private void DropBackend(ITerminalBackend backend)
+    {
+        backend.Dispose();
+        if (ReferenceEquals(_conn, backend)) _conn = null;
     }
 
     /// <summary>
@@ -312,9 +324,8 @@ public class SessionView : Grid
         }
         catch (Exception ex)
         {
-            _conn = null;
-            local.Dispose();
-            Fail(ex.Message);
+            DropBackend(local);
+            if (!_closed) Fail(ex.Message);
         }
     }
 
@@ -330,16 +341,28 @@ public class SessionView : Grid
     /// <summary>Wire a backend's events to this view (shared by SSH and local shells).</summary>
     private void HookBackend(ITerminalBackend backend)
     {
-        backend.StatusChanged += SetStatusText;
-        backend.DataReceived += bytes => { _term!.Feed(bytes); _recorder.Write(bytes); };
+        // Events from a backend that has been replaced (reconnect) or dropped (close) are
+        // ignored: its teardown runs in the background and must not overwrite the state
+        // of the connection that replaced it.
+        bool Current() => ReferenceEquals(_conn, backend);
+
+        backend.StatusChanged += s => { if (Current()) SetStatusText(s); };
+        backend.DataReceived += bytes =>
+        {
+            if (!Current()) return;
+            _term!.Feed(bytes);
+            _recorder.Write(bytes);
+        };
         backend.Closed += msg =>
         {
+            if (!Current()) return;
             if (_state != ConnectionState.Connecting)
                 SetState(ConnectionState.Disconnected, msg);
             Dispatcher.BeginInvoke(() => ConnectionClosed?.Invoke(this));
         };
         backend.ShellExited += () =>
         {
+            if (!Current()) return;
             SetState(ConnectionState.Disconnected, "Shell closed");
             Dispatcher.BeginInvoke(() => ShellExited?.Invoke(this));
         };
@@ -375,11 +398,20 @@ public class SessionView : Grid
             await _wscp!.ReconnectAsync();
             return;
         }
-        _conn?.Dispose();
-        _conn = null;
+        DisposeInBackground();
         SetState(ConnectionState.Connecting, "Reconnecting …");
         await ConnectAsync();
         _term?.Focus();
+    }
+
+    /// <summary>Detach the current backend and tear it down off the UI thread, so a
+    /// wedged socket or a slow ConPTY shutdown can't freeze the app.</summary>
+    private void DisposeInBackground()
+    {
+        var conn = _conn;
+        _conn = null;
+        if (conn != null)
+            Task.Run(() => { try { conn.Dispose(); } catch { /* best effort */ } });
     }
 
     /// <summary>Change connection state (dot colour + status bar) and status text.
@@ -469,28 +501,13 @@ public class SessionView : Grid
         catch { /* explorer unavailable */ }
     }
 
+    /// <summary>Stop the UI timers now and tear the connection down in the background.</summary>
     public void Close()
     {
+        _closed = true;
         _recorder.Stop();
         _term?.Shutdown();
         _wscp?.Shutdown();
-        _conn?.Dispose();
-        _conn = null;
-    }
-
-    /// <summary>
-    /// Like <see cref="Close"/>, but tears the SSH connection down on a background
-    /// thread so a wedged socket can't block the caller (used on app shutdown).
-    /// The UI timers are still stopped synchronously on the calling (UI) thread.
-    /// </summary>
-    public void CloseAsync()
-    {
-        _recorder.Stop();
-        _term?.Shutdown();
-        _wscp?.Shutdown();
-        var conn = _conn;
-        _conn = null;
-        if (conn != null)
-            Task.Run(() => { try { conn.Dispose(); } catch { /* best effort */ } });
+        DisposeInBackground();
     }
 }

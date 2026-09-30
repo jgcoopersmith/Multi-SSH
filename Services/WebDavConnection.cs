@@ -177,7 +177,11 @@ public class WebDavConnection : InteractivePromptBackend
         var localPath = Path.IsPathRooted(localName) ? localName : Path.Combine(LocalDir, localName);
         using var resp = _http!.Send(new HttpRequestMessage(HttpMethod.Get, Url(remote)));
         resp.EnsureSuccessStatusCode();
-        using (var fs = File.Create(localPath)) resp.Content.ReadAsStream().CopyTo(fs);
+        LocalFile.WriteViaTemp(localPath, tmp =>
+        {
+            using var fs = File.Create(tmp);
+            resp.Content.ReadAsStream().CopyTo(fs);
+        });
         Line($"downloaded {remote} -> {localPath} ({new FileInfo(localPath).Length} bytes)");
     }
 

@@ -185,7 +185,8 @@ public partial class ConfigDialog : Window
     private void Connect_Click(object sender, RoutedEventArgs e)
     {
         var kind = SelectedKind;
-        if ((kind == SessionKind.Ssh || kind == SessionKind.Wscp) && string.IsNullOrWhiteSpace(HostBox.Text))
+        // Every remote kind needs a host — the caller silently discards one saved without it.
+        if (!SessionConfig.IsLocalKind(kind) && string.IsNullOrWhiteSpace(HostBox.Text))
         {
             MessageBox.Show(this, "Please enter a host name or IP address.", "Multi-SSH",
                 MessageBoxButton.OK, MessageBoxImage.Warning);

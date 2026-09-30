@@ -18,6 +18,7 @@ public class SshConnection : ITerminalBackend
     private ShellStream? _shell;
     private Thread? _readThread;
     private volatile bool _disposed;
+    private volatile bool _connectionError;
 
     public event Action<byte[]>? DataReceived;
     public event Action<string>? StatusChanged;
@@ -36,25 +37,42 @@ public class SshConnection : ITerminalBackend
         // Build the connection info off the UI thread — resolving a forced IPv4/IPv6
         // host does a DNS lookup, which we don't want to block the UI with.
         var info = await Task.Run(() => RemoteAuth.BuildConnectionInfo(_cfg));
-        _client = new SshClient(info);
-        _client.KeepAliveInterval = _cfg.KeepAliveSeconds > 0
+        // Disposed while resolving (tab closed): don't open a connection nobody will close.
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var client = new SshClient(info);
+        _client = client;
+        client.KeepAliveInterval = _cfg.KeepAliveSeconds > 0
             ? TimeSpan.FromSeconds(_cfg.KeepAliveSeconds)
             : Timeout.InfiniteTimeSpan;
-        _client.ErrorOccurred += (_, e) => StatusChanged?.Invoke("Error: " + e.Exception.Message);
+        client.ErrorOccurred += (_, e) =>
+        {
+            _connectionError = true;
+            StatusChanged?.Invoke("Error: " + e.Exception.Message);
+        };
 
-        await Task.Run(() => _client.Connect());
-        RemoteAuth.ApplySocketOptions(_client, _cfg);   // TCP_NODELAY / SO_KEEPALIVE
+        await Task.Run(() => client.Connect());
+        if (_disposed)
+        {
+            try { client.Dispose(); } catch { /* already torn down */ }
+            throw new ObjectDisposedException(nameof(SshConnection));
+        }
+        RemoteAuth.ApplySocketOptions(client, _cfg);   // TCP_NODELAY / SO_KEEPALIVE
 
         StatusChanged?.Invoke($"Connected — {_cfg.Username}@{_cfg.Host}");
 
         var modes = new Dictionary<Renci.SshNet.Common.TerminalModes, uint>();
-        _shell = _client.CreateShellStream(
+        _shell = client.CreateShellStream(
             _cfg.TerminalType,
             (uint)cols, (uint)rows,
             (uint)(cols * 8), (uint)(rows * 16),
             8192, modes);
 
-        _shell.ErrorOccurred += (_, e) => StatusChanged?.Invoke("Shell error: " + e.Exception.Message);
+        _shell.ErrorOccurred += (_, e) =>
+        {
+            _connectionError = true;
+            StatusChanged?.Invoke("Shell error: " + e.Exception.Message);
+        };
 
         // Read on a background thread: a blocking Read returns 0 at EOF when the
         // remote shell exits, which lets us tear the window down automatically.
@@ -66,27 +84,39 @@ public class SshConnection : ITerminalBackend
     {
         var buf = new byte[8192];
         var shell = _shell;
+        var client = _client;
+        string? failure = null;
         try
         {
             while (!_disposed && shell != null)
             {
                 int n = shell.Read(buf, 0, buf.Length);
-                if (n <= 0) break; // EOF — the shell has exited
+                if (n <= 0) break; // EOF — the channel closed
                 var slice = new byte[n];
                 Array.Copy(buf, slice, n);
                 DataReceived?.Invoke(slice);
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Stream disposed or connection dropped — treated the same as EOF.
+            failure = ex.Message;
         }
         finally
         {
             if (!_disposed)
             {
-                StatusChanged?.Invoke("Shell closed");
-                ShellExited?.Invoke();
+                // Only a clean EOF on a still-live session means the remote shell exited
+                // (which closes the pane). A dropped link keeps the pane so the user keeps
+                // the scrollback and can Reconnect.
+                if (failure == null && !_connectionError && (client?.IsConnected ?? false))
+                {
+                    StatusChanged?.Invoke("Shell closed");
+                    ShellExited?.Invoke();
+                }
+                else
+                {
+                    Closed?.Invoke("Connection lost" + (failure != null ? ": " + failure : ""));
+                }
             }
         }
     }

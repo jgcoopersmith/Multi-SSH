@@ -106,7 +106,11 @@ public class SftpConnection : InteractivePromptBackend
         var remote = args[0];
         var localName = args.Count > 1 ? args[1] : Path.GetFileName(remote.TrimEnd('/'));
         var localPath = Path.IsPathRooted(localName) ? localName : Path.Combine(LocalDir, localName);
-        using (var fs = File.Create(localPath)) _sftp!.DownloadFile(remote, fs);
+        LocalFile.WriteViaTemp(localPath, tmp =>
+        {
+            using var fs = File.Create(tmp);
+            _sftp!.DownloadFile(remote, fs);
+        });
         Line($"downloaded {remote} -> {localPath} ({new FileInfo(localPath).Length} bytes)");
     }
 

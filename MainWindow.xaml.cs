@@ -1326,6 +1326,6 @@ public partial class MainWindow : Window
 
         // Close connections without blocking the UI thread: a wedged socket in
         // Disconnect() must not hang the quit. Teardown is best-effort from here.
-        foreach (var p in _panes) p.Session.CloseAsync();
+        foreach (var p in _panes) p.Session.Close();
     }
 }

@@ -92,22 +92,33 @@ public class AnsiParser
 
     private void Csi(byte b)
     {
-        char c = (char)b;
-        // Parameter / intermediate bytes.
-        if ((c >= '0' && c <= '9') || c == ';' || c == '?' || c == ':' || c == ' ' || c == '>' || c == '!')
+        // Parameter bytes 0x30-0x3F (digits ; : < = > ?) and intermediates 0x20-0x2F.
+        if (b >= 0x20 && b <= 0x3F)
         {
             // Cap the parameter run so a malformed/hostile stream of digits can't grow
             // this buffer without bound. A real CSI never needs more than a few dozen chars.
-            if (_params.Length < 256) _params.Append(c);
+            if (_params.Length < 256) _params.Append((char)b);
             return;
         }
-        DispatchCsi(c, _params.ToString());
-        _state = State.Ground;
+        if (b >= 0x40 && b <= 0x7E)
+        {
+            DispatchCsi((char)b, _params.ToString());
+            _state = State.Ground;
+            return;
+        }
+        if (b == 0x1B) { _state = State.Escape; return; }   // ESC aborts and starts a new sequence
+        if (b < 0x20) { Ground(b); return; }                // C0 controls still execute mid-sequence
+        _state = State.Ground;                               // anything else: abandon the sequence
     }
 
     private void DispatchCsi(char final, string raw)
     {
+        // Sequences with intermediates (CSI ... $ p, CSI SP q, CSI ! p) or a '<', '=', '>'
+        // prefix (e.g. vim's CSI > 4 ; 2 m) aren't modelled; parsing them as plain
+        // parameters would misapply them as SGR, cursor moves, etc.
+        if (raw.Length > 0 && (raw[0] is '<' or '=' or '>' || raw[^1] <= '/')) return;
         bool priv = raw.StartsWith("?");
+        if (priv && final is not ('h' or 'l' or 'J' or 'K')) return;
         string body = priv ? raw.Substring(1) : raw;
         int[] ps = ParseParams(body);
         int P0 = ps.Length > 0 ? ps[0] : 0;

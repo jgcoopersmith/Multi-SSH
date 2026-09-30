@@ -40,7 +40,7 @@ try {
     Write-Host "Compiling installer..." -ForegroundColor Cyan
     & $iscc "installer\Multi-SSH.iss" | Out-Host
 
-    $setup = "installer\Output\Multi-SSH-Setup-1.0.55.exe"
+    $setup = "installer\Output\Multi-SSH-Setup-1.0.56.exe"
     Sign $setup        # sign the installer itself
 
     Write-Host "Done: $setup" -ForegroundColor Green

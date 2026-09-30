@@ -77,20 +77,23 @@ public class TerminalBuffer
         }
 
         // Growing: keep existing lines anchored to the TOP and let the new blank rows
-        // appear at the bottom (standard terminal behaviour). Bottom-aligning a grow would
-        // push a freshly started shell's prompt — and the cursor — into the middle of the
-        // pane. Shrinking: keep the BOTTOM rows (the most recent output and the prompt) and
-        // let the oldest rows fall away.
-        bool growing = rows >= oldRows;
+        // appear at the bottom, so a fresh shell's prompt stays at the top.
+        // Shrinking: drop the rows below the cursor first (normally blank), and only if
+        // that isn't enough, move the oldest top rows into scrollback so no output is lost.
+        int shift = 0;   // rows removed from the top
+        if (rows < oldRows)
+        {
+            int excess = oldRows - rows;
+            int belowCursor = Math.Max(0, oldRows - 1 - CursorY);
+            shift = excess - Math.Min(excess, belowCursor);
+            if (PushErasedToScrollback)
+                for (int r = 0; r < shift; r++) AddToScrollback(_grid[r]);
+        }
         int copyRows = Math.Min(rows, oldRows);
         int copyCols = Math.Min(cols, Cols);
         for (int r = 0; r < copyRows; r++)
-        {
-            int srcRow = growing ? r : oldRows - copyRows + r;
-            int dstRow = growing ? r : rows - copyRows + r;
             for (int c = 0; c < copyCols; c++)
-                newGrid[dstRow][c] = _grid[srcRow][c];
-        }
+                newGrid[r][c] = _grid[r + shift][c];
 
         _grid = newGrid;
         Rows = rows;
@@ -98,11 +101,8 @@ public class TerminalBuffer
         _scrollTop = 0;
         _scrollBottom = rows - 1;
         CursorX = Math.Min(CursorX, cols - 1);
-        // Growing leaves the cursor on its line (content stayed at the top). Shrinking moved
-        // the kept content up by (oldRows-rows), so move the cursor by the same amount.
-        CursorY = growing
-            ? Math.Min(CursorY, rows - 1)
-            : Math.Clamp(CursorY + (rows - oldRows), 0, rows - 1);
+        CursorY = Math.Clamp(CursorY - shift, 0, rows - 1);
+        _savedY = Math.Max(0, _savedY - shift);
         WrapPending = false;
     }
 
@@ -208,7 +208,10 @@ public class TerminalBuffer
 
     public void RestoreCursor()
     {
-        CursorX = _savedX; CursorY = _savedY;
+        // The grid may have shrunk since the save; an out-of-range cursor would make every
+        // later write throw, freezing the terminal.
+        CursorX = Math.Clamp(_savedX, 0, Cols - 1);
+        CursorY = Math.Clamp(_savedY, 0, Rows - 1);
         _fg = _savedFg; _bg = _savedBg; _flags = _savedFlags;
         WrapPending = false;
     }
@@ -237,15 +240,7 @@ public class TerminalBuffer
             {
                 var snapshot = new Cell[Cols];
                 Array.Copy(_grid[0], snapshot, Cols);
-                _scrollback.Add(snapshot);
-                if (_scrollback.Count > MaxScrollback)
-                {
-                    _scrollback.RemoveAt(0);
-                    // Dropping the oldest history line renumbers every row below it.
-                    // Anything holding a row index (a live selection, the scroll
-                    // position) has to be told, or it silently points at other text.
-                    TrimmedLines++;
-                }
+                AddToScrollback(snapshot);
             }
 
             var recycled = _grid[_scrollTop];
@@ -253,6 +248,18 @@ public class TerminalBuffer
                 _grid[r] = _grid[r + 1];
             BlankLine(recycled);
             _grid[_scrollBottom] = recycled;
+        }
+    }
+
+    private void AddToScrollback(Cell[] row)
+    {
+        _scrollback.Add(row);
+        if (_scrollback.Count > MaxScrollback)
+        {
+            _scrollback.RemoveAt(0);
+            // Dropping the oldest history line renumbers every row below it. Anything
+            // holding a row index (a live selection, the scroll position) has to be told.
+            TrimmedLines++;
         }
     }
 

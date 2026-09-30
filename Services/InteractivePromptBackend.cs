@@ -51,6 +51,12 @@ public abstract class InteractivePromptBackend : ITerminalBackend
     {
         StatusChanged?.Invoke($"Connecting to {Cfg.Host}:{Cfg.Port} …");
         await Task.Run(ConnectClient);   // exceptions bubble to the connect loop
+        if (_disposed)
+        {
+            // Closed while connecting: Dispose may have run before the client existed.
+            try { DisposeClient(); } catch { /* best effort */ }
+            throw new ObjectDisposedException(GetType().Name);
+        }
         _connected = true;
         StatusChanged?.Invoke($"Connected — {SessionConfig.KindName(Cfg.Kind)} {Cfg.Username}@{Cfg.Host}");
         WriteWelcome();

@@ -29,7 +29,13 @@ public class WscpPanel : Grid
     private string _remoteCwd = "/";
     private string _localCwd;
     private bool _connecting;
-    private bool _busy;
+    private bool _shutdown;
+    /// <summary>Serialises every request on the single SFTP channel (listings and operations).</summary>
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private bool _opRunning;
+    private Task? _currentOp;
+    /// <summary>Cancelled on disconnect so a multi-file operation stops between files.</summary>
+    private CancellationTokenSource _cts = new();
     private string _connectedStatus = "";
     /// <summary>Last completed operation's result line (e.g. "Uploaded 3 item(s)"), kept
     /// visible through the auto-refresh that follows it. Null falls back to the idle line.</summary>
@@ -130,6 +136,14 @@ public class WscpPanel : Grid
                     RemoteAuth.ApplySocketOptions(client, _cfg);
                 });
 
+                if (_shutdown)
+                {
+                    // The pane closed while connecting — don't keep a session nobody owns.
+                    var orphan = client;
+                    _ = Task.Run(() => { try { orphan?.Dispose(); } catch { } });
+                    return;
+                }
+                _cts = new CancellationTokenSource();
                 _sftp = client;
                 _remoteCwd = _sftp!.WorkingDirectory;
                 _connectedStatus = $"Connected — {_cfg.Username}@{_cfg.Host}";
@@ -190,38 +204,73 @@ public class WscpPanel : Grid
 
     public void FocusDefault() => (_sftp != null ? _remoteList : _localList).Focus();
 
-    public void Shutdown() => DisconnectClient();
+    public void Shutdown()
+    {
+        _shutdown = true;
+        DisconnectClient();
+    }
 
     private void DisconnectClient()
     {
         var s = _sftp;
         _sftp = null;
-        if (s != null) Task.Run(() => { try { s.Disconnect(); } catch { } try { s.Dispose(); } catch { } });
+        _cts.Cancel();   // a multi-file operation stops after the file it is on
+        var op = _currentOp;
+        if (s != null)
+            Task.Run(async () =>
+            {
+                // Let the in-flight file finish before the client it is using goes away,
+                // or the transfer is cut off and leaves a partial file.
+                if (op != null) { try { await op.WaitAsync(TimeSpan.FromSeconds(30)); } catch { } }
+                try { s.Disconnect(); } catch { }
+                try { s.Dispose(); } catch { }
+            });
     }
 
     // -------------------- background operation runner --------------------
 
     /// <summary>Run a blocking SFTP operation off the UI thread, then refresh both panes.
-    /// Serialised via <see cref="_busy"/> so operations never overlap on the single client.</summary>
-    private async Task DoAsync(string busyText, Action work, bool refreshRemote = true, bool refreshLocal = true)
+    /// The operation gets the client it started with, so a disconnect can't swap it mid-run.</summary>
+    private async Task DoAsync(string busyText, Action<SftpClient, CancellationToken> work,
+        bool refreshRemote = true, bool refreshLocal = true)
     {
         if (_sftp == null || !_sftp.IsConnected) { Status("Not connected"); return; }
-        if (_busy) return;
-        _busy = true;
-        _lastResult = null;
-        Status(busyText);
+        if (_opRunning) { Status("Busy — wait for the current operation to finish"); return; }
+        _opRunning = true;
         try
         {
-            await Task.Run(work);
-            Settle();
+            await _gate.WaitAsync();   // an auto-refresh listing may still hold it; it's quick
+            try
+            {
+                var sftp = _sftp;
+                if (sftp == null || !sftp.IsConnected) { Status("Not connected"); return; }
+                var ct = _cts.Token;
+                _lastResult = null;
+                Status(busyText);
+                try
+                {
+                    var op = Task.Run(() => work(sftp, ct));
+                    _currentOp = op;
+                    await op;
+                    Settle();
+                }
+                catch (OperationCanceledException) { /* disconnected mid-operation */ }
+                catch (Exception ex)
+                {
+                    if (_shutdown) return;
+                    Status("Error: " + ex.Message);
+                    MessageBox.Show(Window.GetWindow(this), ex.Message, "WSCP", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            }
+            finally
+            {
+                _currentOp = null;
+                _gate.Release();
+            }
         }
-        catch (Exception ex)
-        {
-            Status("Error: " + ex.Message);
-            MessageBox.Show(Window.GetWindow(this), ex.Message, "WSCP", MessageBoxButton.OK, MessageBoxImage.Warning);
-        }
-        finally { _busy = false; }
+        finally { _opRunning = false; }
 
+        if (_shutdown) return;
         if (refreshRemote) RefreshRemote();
         if (refreshLocal) RefreshLocal();
     }
@@ -231,15 +280,12 @@ public class WscpPanel : Grid
     private async void RefreshRemote()
     {
         // SSH.NET's SftpClient shares one channel and is not safe for concurrent requests,
-        // so every remote listing is serialised through _busy — the same flag that guards
-        // transfers. Running the listing on a bare thread (as before) let a manual Refresh
-        // overlap another request and wedge the channel, after which Refresh silently did
-        // nothing. A refresh requested while an op is already running is dropped on purpose:
-        // that op refreshes both panes when it finishes.
+        // so every remote listing is serialised through _gate — the same lock that guards
+        // operations. A refresh requested while an op is already running is dropped on
+        // purpose: that op refreshes both panes when it finishes.
         var sftp = _sftp;                       // capture: the pane may close and null the field
         if (sftp == null || !sftp.IsConnected) { Status("Not connected"); return; }
-        if (_busy) return;
-        _busy = true;
+        if (!_gate.Wait(0)) return;
         Status("Refreshing…");
         try
         {
@@ -252,7 +298,7 @@ public class WscpPanel : Grid
         {
             Status("Error: " + ex.Message);
         }
-        finally { _busy = false; }
+        finally { _gate.Release(); }
     }
 
     private void PopulateRemote(List<ISftpFile> files)
@@ -271,10 +317,10 @@ public class WscpPanel : Grid
 
     private async void NavigateRemote(string path)
     {
-        await DoAsync($"Opening {path}…", () =>
+        await DoAsync($"Opening {path}…", (sftp, _) =>
         {
-            _sftp!.ChangeDirectory(path);
-            _remoteCwd = _sftp.WorkingDirectory;
+            sftp.ChangeDirectory(path);
+            _remoteCwd = sftp.WorkingDirectory;
         }, refreshLocal: false);
     }
 
@@ -321,24 +367,25 @@ public class WscpPanel : Grid
     {
         var items = SelectedLocal();
         if (items.Count == 0) { Status("Select local files to upload"); return; }
-        await DoAsync($"Uploading {items.Count} item(s)…", () =>
+        await DoAsync($"Uploading {items.Count} item(s)…", (sftp, ct) =>
         {
             for (int i = 0; i < items.Count; i++)
-                UploadPath(Path.Combine(_localCwd, items[i].Name),
+                UploadPath(sftp, ct, Path.Combine(_localCwd, items[i].Name),
                     CombineRemote(_remoteCwd, items[i].Name), i + 1, items.Count);
             _lastResult = $"✔ Uploaded {items.Count} item(s) to {_remoteCwd}";
         });
     }
 
-    private void UploadPath(string localPath, string remotePath, int idx, int total)
+    private void UploadPath(SftpClient sftp, CancellationToken ct, string localPath, string remotePath, int idx, int total)
     {
+        ct.ThrowIfCancellationRequested();
         if (Directory.Exists(localPath))
         {
-            EnsureRemoteDir(remotePath);
+            EnsureRemoteDir(sftp, remotePath);
             foreach (var d in Directory.GetDirectories(localPath))
-                UploadPath(d, CombineRemote(remotePath, Path.GetFileName(d)), idx, total);
+                UploadPath(sftp, ct, d, CombineRemote(remotePath, Path.GetFileName(d)), idx, total);
             foreach (var f in Directory.GetFiles(localPath))
-                UploadPath(f, CombineRemote(remotePath, Path.GetFileName(f)), idx, total);
+                UploadPath(sftp, ct, f, CombineRemote(remotePath, Path.GetFileName(f)), idx, total);
         }
         else
         {
@@ -346,14 +393,14 @@ public class WscpPanel : Grid
             string name = Path.GetFileName(localPath);
             _progWatch.Reset();                 // first callback of a new file reports at once
             using var fs = File.OpenRead(localPath);
-            _sftp!.UploadFile(fs, remotePath, canOverride: true,
+            sftp.UploadFile(fs, remotePath, canOverride: true,
                 sent => ReportTransfer("Uploading", name, idx, total, sent, size));
         }
     }
 
-    private void EnsureRemoteDir(string path)
+    private static void EnsureRemoteDir(SftpClient sftp, string path)
     {
-        try { if (!_sftp!.Exists(path)) _sftp.CreateDirectory(path); }
+        try { if (!sftp.Exists(path)) sftp.CreateDirectory(path); }
         catch { /* may already exist */ }
     }
 
@@ -361,35 +408,41 @@ public class WscpPanel : Grid
     {
         var items = SelectedRemote();
         if (items.Count == 0) { Status("Select remote files to download"); return; }
-        await DoAsync($"Downloading {items.Count} item(s)…", () =>
+        await DoAsync($"Downloading {items.Count} item(s)…", (sftp, ct) =>
         {
             for (int i = 0; i < items.Count; i++)
-                DownloadPath(CombineRemote(_remoteCwd, items[i].Name),
+                DownloadPath(sftp, ct, CombineRemote(_remoteCwd, items[i].Name),
                     Path.Combine(_localCwd, items[i].Name), items[i].IsDirectory, i + 1, items.Count);
             _lastResult = $"✔ Downloaded {items.Count} item(s) to {_localCwd}";
         });
     }
 
-    private void DownloadPath(string remotePath, string localPath, bool isDir, int idx, int total)
+    private void DownloadPath(SftpClient sftp, CancellationToken ct, string remotePath, string localPath,
+        bool isDir, int idx, int total)
     {
+        ct.ThrowIfCancellationRequested();
         if (isDir)
         {
             Directory.CreateDirectory(localPath);
-            foreach (var f in _sftp!.ListDirectory(remotePath))
+            foreach (var f in sftp.ListDirectory(remotePath))
             {
                 if (f.Name is "." or "..") continue;
-                DownloadPath(CombineRemote(remotePath, f.Name), Path.Combine(localPath, f.Name), f.IsDirectory, idx, total);
+                DownloadPath(sftp, ct, CombineRemote(remotePath, f.Name), Path.Combine(localPath, f.Name),
+                    f.IsDirectory, idx, total);
             }
         }
         else
         {
             string name = Path.GetFileName(localPath);
             long size = 0;
-            try { size = _sftp!.GetAttributes(remotePath).Size; } catch { /* size unknown → show bytes */ }
+            try { size = sftp.GetAttributes(remotePath).Size; } catch { /* size unknown → show bytes */ }
             _progWatch.Reset();                 // first callback of a new file reports at once
-            using var fs = File.Create(localPath);
-            _sftp!.DownloadFile(remotePath, fs,
-                got => ReportTransfer("Downloading", name, idx, total, got, size));
+            LocalFile.WriteViaTemp(localPath, tmp =>
+            {
+                using var fs = File.Create(tmp);
+                sftp.DownloadFile(remotePath, fs,
+                    got => ReportTransfer("Downloading", name, idx, total, got, size));
+            });
         }
     }
 
@@ -424,7 +477,7 @@ public class WscpPanel : Grid
         name = name.Trim();
 
         if (remote)
-            await DoAsync($"Creating {name}…", () => _sftp!.CreateDirectory(CombineRemote(_remoteCwd, name)), refreshLocal: false);
+            await DoAsync($"Creating {name}…", (sftp, _) => sftp.CreateDirectory(CombineRemote(_remoteCwd, name)), refreshLocal: false);
         else
         {
             try { Directory.CreateDirectory(Path.Combine(_localCwd, name)); } catch (Exception ex) { Status("Local: " + ex.Message); }
@@ -442,7 +495,7 @@ public class WscpPanel : Grid
 
         if (remote)
             await DoAsync($"Renaming {it.Name}…",
-                () => _sftp!.RenameFile(CombineRemote(_remoteCwd, it.Name), CombineRemote(_remoteCwd, name)),
+                (sftp, _) => sftp.RenameFile(CombineRemote(_remoteCwd, it.Name), CombineRemote(_remoteCwd, name)),
                 refreshLocal: false);
         else
         {
@@ -469,9 +522,13 @@ public class WscpPanel : Grid
             return;
 
         if (remote)
-            await DoAsync($"Deleting {items.Count} item(s)…", () =>
+            await DoAsync($"Deleting {items.Count} item(s)…", (sftp, ct) =>
             {
-                foreach (var it in items) DeleteRemote(CombineRemote(_remoteCwd, it.Name), it.IsDirectory);
+                foreach (var it in items)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    DeleteRemote(sftp, CombineRemote(_remoteCwd, it.Name), it.IsDirectory);
+                }
             }, refreshLocal: false);
         else
         {
@@ -488,18 +545,18 @@ public class WscpPanel : Grid
         }
     }
 
-    private void DeleteRemote(string path, bool isDir)
+    private static void DeleteRemote(SftpClient sftp, string path, bool isDir)
     {
         if (isDir)
         {
-            foreach (var f in _sftp!.ListDirectory(path))
+            foreach (var f in sftp.ListDirectory(path))
             {
                 if (f.Name is "." or "..") continue;
-                DeleteRemote(CombineRemote(path, f.Name), f.IsDirectory);
+                DeleteRemote(sftp, CombineRemote(path, f.Name), f.IsDirectory);
             }
-            _sftp.DeleteDirectory(path);
+            sftp.DeleteDirectory(path);
         }
-        else _sftp!.DeleteFile(path);
+        else sftp.DeleteFile(path);
     }
 
     // -------------------- selection helpers --------------------
