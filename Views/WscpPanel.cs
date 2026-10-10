@@ -42,6 +42,9 @@ public class WscpPanel : Grid
     private string? _lastResult;
     /// <summary>Throttle timer for per-file transfer progress updates.</summary>
     private readonly System.Diagnostics.Stopwatch _progWatch = new();
+    /// <summary>A transfer cut off by a dropped link (or by Reconnect mid-transfer). It carries
+    /// on from where its files stopped as soon as the session is connected again.</summary>
+    private TransferJob? _interrupted;
 
     private readonly ObservableCollection<FsItem> _localItems = new();
     private readonly ObservableCollection<FsItem> _remoteItems = new();
@@ -148,9 +151,7 @@ public class WscpPanel : Grid
                 _remoteCwd = _sftp!.WorkingDirectory;
                 _connectedStatus = $"Connected — {_cfg.Username}@{_cfg.Host}";
                 Emit(ConnectionState.Connected, _connectedStatus);
-                // Wait rather than skip: a listing or operation on the previous client may
-                // still hold the gate, and skipping would leave its stale listing on screen.
-                RefreshRemote(waitForGate: true);
+                _ = AfterConnectAsync();
                 return;
             }
             catch (SshAuthenticationException ex)
@@ -180,6 +181,18 @@ public class WscpPanel : Grid
                 return;
             }
         }
+    }
+
+    /// <summary>List the remote folder, then carry on with any transfer the previous
+    /// connection was cut off in the middle of.</summary>
+    private async Task AfterConnectAsync()
+    {
+        // Wait rather than skip: a listing or operation on the previous client may
+        // still hold the gate, and skipping would leave its stale listing on screen.
+        await RefreshRemote(waitForGate: true);
+        var job = _interrupted;
+        if (job == null || _shutdown || _sftp == null || !_sftp.IsConnected) return;
+        await RunTransferAsync(job, resumed: true);
     }
 
     private static bool UsesPassword(AuthMethod m)
@@ -218,15 +231,22 @@ public class WscpPanel : Grid
     {
         var s = _sftp;
         _sftp = null;
-        _cts.Cancel();   // a multi-file operation stops after the file it is on
+        _cts.Cancel();   // a transfer stops at its next chunk and keeps its partial file to resume
         var op = _currentOp;
         if (s != null)
             Task.Run(async () =>
             {
-                // Let the in-flight file finish before the client it is using goes away,
-                // or the transfer is cut off and leaves a partial file.
-                if (op != null) { try { await op.WaitAsync(TimeSpan.FromSeconds(30)); } catch { } }
-                try { s.Disconnect(); } catch { }
+                // Give the operation a moment to stop cleanly, and the server a moment to take
+                // a clean disconnect. A server that has stopped answering gets neither: then
+                // the socket is cut, which fails the stuck requests so the operation ends.
+                if (op != null) { try { await op.WaitAsync(TimeSpan.FromSeconds(3)); } catch { } }
+                bool stuck = op is { IsCompleted: false };
+                if (!stuck)
+                {
+                    var bye = Task.Run(() => { try { s.Disconnect(); } catch { } });
+                    stuck = !await bye.WaitAsync(TimeSpan.FromSeconds(3)).ContinueWith(t => t.IsCompletedSuccessfully);
+                }
+                if (stuck) RemoteAuth.AbortSocket(s);
                 try { s.Dispose(); } catch { }
             });
     }
@@ -236,7 +256,7 @@ public class WscpPanel : Grid
     /// <summary>Run a blocking SFTP operation off the UI thread, then refresh both panes.
     /// The operation gets the client it started with, so a disconnect can't swap it mid-run.</summary>
     private async Task DoAsync(string busyText, Action<SftpClient, CancellationToken> work,
-        bool refreshRemote = true, bool refreshLocal = true)
+        bool refreshRemote = true, bool refreshLocal = true, TransferJob? job = null)
     {
         if (_sftp == null || !_sftp.IsConnected) { Status("Not connected"); return; }
         if (_opRunning) { Status("Busy — wait for the current operation to finish"); return; }
@@ -250,6 +270,7 @@ public class WscpPanel : Grid
                 if (sftp == null || !sftp.IsConnected) { Status("Not connected"); return; }
                 var ct = _cts.Token;
                 _lastResult = null;
+                if (job != null && ReferenceEquals(job, _interrupted)) _interrupted = null;   // resuming it now
                 Status(busyText);
                 try
                 {
@@ -257,6 +278,19 @@ public class WscpPanel : Grid
                     _currentOp = op;
                     await op;
                     Settle();
+                }
+                catch (Exception ex) when (job != null && SftpTransfer.IsLinkLoss(ex, sftp))
+                {
+                    // Keep the job: its files carry on from where they stopped once reconnected.
+                    _interrupted = job;
+                    // Closing, or Reconnect already replaced the client and will resume the job.
+                    if (_shutdown || !ReferenceEquals(sftp, _sftp)) return;
+                    Emit(ConnectionState.Disconnected, "Connection lost — transfer paused. Reconnect (⟳) to resume it.");
+                    MessageBox.Show(Window.GetWindow(this),
+                        $"Connection lost: {ex.Message}\n\nThe transfer is paused and the partial file is kept. " +
+                        "Click ⟳ Reconnect to resume it from where it stopped.",
+                        "WSCP", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
                 }
                 catch (OperationCanceledException) { /* disconnected mid-operation */ }
                 catch (Exception ex)
@@ -275,13 +309,13 @@ public class WscpPanel : Grid
         finally { _opRunning = false; }
 
         if (_shutdown) return;
-        if (refreshRemote) RefreshRemote();
+        if (refreshRemote) _ = RefreshRemote();
         if (refreshLocal) RefreshLocal();
     }
 
     // -------------------- remote listing / navigation --------------------
 
-    private async void RefreshRemote(bool waitForGate = false)
+    private async Task RefreshRemote(bool waitForGate = false)
     {
         // SSH.NET's SftpClient shares one channel and is not safe for concurrent requests,
         // so every remote listing is serialised through _gate — the same lock that guards
@@ -373,34 +407,63 @@ public class WscpPanel : Grid
     {
         var items = SelectedLocal();
         if (items.Count == 0) { Status("Select local files to upload"); return; }
-        await DoAsync($"Uploading {items.Count} item(s)…", (sftp, ct) =>
-        {
-            for (int i = 0; i < items.Count; i++)
-                UploadPath(sftp, ct, Path.Combine(_localCwd, items[i].Name),
-                    CombineRemote(_remoteCwd, items[i].Name), i + 1, items.Count);
-            _lastResult = $"✔ Uploaded {items.Count} item(s) to {_remoteCwd}";
-        });
+        await RunTransferAsync(new TransferJob(upload: true, _localCwd, _remoteCwd, items), resumed: false);
     }
 
-    private void UploadPath(SftpClient sftp, CancellationToken ct, string localPath, string remotePath, int idx, int total)
+    /// <summary>Run (or resume) a transfer. Files the job already finished are skipped and a
+    /// file it was part-way through carries on from where it stopped.</summary>
+    private Task RunTransferAsync(TransferJob job, bool resumed)
+    {
+        int n = job.Items.Count;
+        string busy = (job.Upload, resumed) switch
+        {
+            (true, false) => $"Uploading {n} item(s)…",
+            (false, false) => $"Downloading {n} item(s)…",
+            (true, true) => $"Resuming upload of {n} item(s)…",
+            (false, true) => $"Resuming download of {n} item(s)…",
+        };
+        return DoAsync(busy, (sftp, ct) =>
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var it = job.Items[i];
+                if (job.Upload)
+                    UploadPath(sftp, ct, job, Path.Combine(job.LocalDir, it.Name),
+                        CombineRemote(job.RemoteDir, it.Name), i + 1, n);
+                else
+                    DownloadPath(sftp, ct, job, CombineRemote(job.RemoteDir, it.Name),
+                        Path.Combine(job.LocalDir, it.Name), it.IsDirectory, i + 1, n);
+            }
+            _lastResult = job.Upload
+                ? $"✔ Uploaded {n} item(s) to {job.RemoteDir}"
+                : $"✔ Downloaded {n} item(s) to {job.LocalDir}";
+        }, job: job);
+    }
+
+    private void UploadPath(SftpClient sftp, CancellationToken ct, TransferJob job, string localPath,
+        string remotePath, int idx, int total)
     {
         ct.ThrowIfCancellationRequested();
         if (Directory.Exists(localPath))
         {
             EnsureRemoteDir(sftp, remotePath);
             foreach (var d in Directory.GetDirectories(localPath))
-                UploadPath(sftp, ct, d, CombineRemote(remotePath, Path.GetFileName(d)), idx, total);
+                UploadPath(sftp, ct, job, d, CombineRemote(remotePath, Path.GetFileName(d)), idx, total);
             foreach (var f in Directory.GetFiles(localPath))
-                UploadPath(sftp, ct, f, CombineRemote(remotePath, Path.GetFileName(f)), idx, total);
+                UploadPath(sftp, ct, job, f, CombineRemote(remotePath, Path.GetFileName(f)), idx, total);
         }
-        else
+        else if (!job.Done.Contains(localPath))
         {
-            long size = new FileInfo(localPath).Length;
-            string name = Path.GetFileName(localPath);
+            var fi = new FileInfo(localPath);
+            string name = fi.Name;
+            // Resume only into a remote file this job itself started writing, from a local
+            // file that hasn't changed since — anything else is uploaded from the beginning.
+            bool unchanged = job.Unchanged(localPath, fi.Length, fi.LastWriteTimeUtc);
+            bool resume = unchanged && job.UploadWasStarted(remotePath);
             _progWatch.Reset();                 // first callback of a new file reports at once
-            using var fs = File.OpenRead(localPath);
-            sftp.UploadFile(fs, remotePath, canOverride: true,
-                sent => ReportTransfer("Uploading", name, idx, total, sent, size));
+            SftpTransfer.Upload(sftp, localPath, remotePath, resume, () => job.MarkUploadStarted(remotePath),
+                (done, size) => ReportTransfer("Uploading", name, idx, total, done, size), ct);
+            job.Done.Add(localPath);
         }
     }
 
@@ -414,17 +477,11 @@ public class WscpPanel : Grid
     {
         var items = SelectedRemote();
         if (items.Count == 0) { Status("Select remote files to download"); return; }
-        await DoAsync($"Downloading {items.Count} item(s)…", (sftp, ct) =>
-        {
-            for (int i = 0; i < items.Count; i++)
-                DownloadPath(sftp, ct, CombineRemote(_remoteCwd, items[i].Name),
-                    Path.Combine(_localCwd, items[i].Name), items[i].IsDirectory, i + 1, items.Count);
-            _lastResult = $"✔ Downloaded {items.Count} item(s) to {_localCwd}";
-        });
+        await RunTransferAsync(new TransferJob(upload: false, _localCwd, _remoteCwd, items), resumed: false);
     }
 
-    private void DownloadPath(SftpClient sftp, CancellationToken ct, string remotePath, string localPath,
-        bool isDir, int idx, int total)
+    private void DownloadPath(SftpClient sftp, CancellationToken ct, TransferJob job, string remotePath,
+        string localPath, bool isDir, int idx, int total)
     {
         ct.ThrowIfCancellationRequested();
         if (isDir)
@@ -433,36 +490,40 @@ public class WscpPanel : Grid
             foreach (var f in sftp.ListDirectory(remotePath))
             {
                 if (f.Name is "." or "..") continue;
-                DownloadPath(sftp, ct, CombineRemote(remotePath, f.Name), Path.Combine(localPath, f.Name),
+                DownloadPath(sftp, ct, job, CombineRemote(remotePath, f.Name), Path.Combine(localPath, f.Name),
                     f.IsDirectory, idx, total);
             }
         }
-        else
+        else if (!job.Done.Contains(remotePath))
         {
             string name = Path.GetFileName(localPath);
-            long size = 0;
-            try { size = sftp.GetAttributes(remotePath).Size; } catch { /* size unknown → show bytes */ }
-            _progWatch.Reset();                 // first callback of a new file reports at once
-            LocalFile.WriteViaTemp(localPath, tmp =>
+            // Carry on from an existing .part unless the remote file changed since this job
+            // first saw it (then the partial copy is of something else and starts over).
+            bool resume = true;
+            try
             {
-                using var fs = File.Create(tmp);
-                sftp.DownloadFile(remotePath, fs,
-                    got => ReportTransfer("Downloading", name, idx, total, got, size));
-            });
+                var a = sftp.GetAttributes(remotePath);
+                resume = job.Unchanged(remotePath, a.Size, a.LastWriteTimeUtc);
+            }
+            catch (SftpException) { /* stat refused — opening the file reports any real problem */ }
+            _progWatch.Reset();                 // first callback of a new file reports at once
+            SftpTransfer.Download(sftp, remotePath, localPath, resume,
+                (done, size) => ReportTransfer("Downloading", name, idx, total, done, size), ct);
+            job.Done.Add(remotePath);
         }
     }
 
     /// <summary>Throttled per-file transfer progress on the status strip. Called from the
-    /// SSH.NET transfer thread on each buffer; limited to a few updates a second so the
+    /// transfer thread on each buffer; limited to a few updates a second so the
     /// dispatcher isn't flooded, but always fires once the file is complete.</summary>
-    private void ReportTransfer(string verb, string name, int idx, int total, ulong done, long size)
+    private void ReportTransfer(string verb, string name, int idx, int total, long done, long size)
     {
-        bool finished = size <= 0 || (long)done >= size;
+        bool finished = size <= 0 || done >= size;
         if (_progWatch.IsRunning && _progWatch.ElapsedMilliseconds < 120 && !finished) return;
         _progWatch.Restart();
         string amount = size > 0
-            ? $"{(long)done * 100 / size}%  ({FmtBytes((long)done)} / {FmtBytes(size)})"
-            : FmtBytes((long)done);
+            ? $"{done * 100 / size}%  ({FmtBytes(done)} / {FmtBytes(size)})"
+            : FmtBytes(done);
         string count = total > 1 ? $" [{idx}/{total}]" : "";
         Status($"{verb}{count}  {name} — {amount}");
     }
@@ -634,7 +695,7 @@ public class WscpPanel : Grid
         tools.Children.Add(ToolButton("↑", "Up one folder",
             (_, _) => { if (remote) NavigateRemote(".."); else NavigateLocal(ParentLocal()); }));
         tools.Children.Add(ToolButton("⟳", "Refresh this pane",
-            (_, _) => { if (remote) RefreshRemote(); else RefreshLocal(); }));
+            (_, _) => { if (remote) _ = RefreshRemote(); else RefreshLocal(); }));
         tools.Children.Add(ToolButton("＋", $"New folder on {side}", (_, _) => NewFolder(remote)));
         tools.Children.Add(ToolButton("✎", $"Rename the selected item on {side}", (_, _) => RenameSelected(remote)));
         tools.Children.Add(ToolButton("🗑", $"Delete the selected item(s) on {side}", (_, _) => DeleteSelected(remote)));
@@ -713,6 +774,49 @@ public class WscpPanel : Grid
         };
         t.SetResourceReference(TextBlock.ForegroundProperty, ThemeManager.Text);
         return t;
+    }
+
+    // -------------------- transfer job --------------------
+
+    /// <summary>One upload or download of a selection, kept so it can be resumed after the
+    /// link drops: the folders it ran between, the items, and how far it got.</summary>
+    private sealed class TransferJob
+    {
+        public bool Upload { get; }
+        public string LocalDir { get; }
+        public string RemoteDir { get; }
+        public List<FsItem> Items { get; }
+
+        /// <summary>Source files transferred in full — skipped when the job resumes.</summary>
+        public HashSet<string> Done { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>Remote files the server has accepted upload data for in this job, whose
+        /// contents are therefore its own and safe to carry on from. Marked from SSH.NET's
+        /// progress thread, hence the lock.</summary>
+        private readonly HashSet<string> _uploadStarted = new(StringComparer.Ordinal);
+
+        public void MarkUploadStarted(string remotePath) { lock (_uploadStarted) _uploadStarted.Add(remotePath); }
+
+        public bool UploadWasStarted(string remotePath) { lock (_uploadStarted) return _uploadStarted.Contains(remotePath); }
+
+        private readonly Dictionary<string, (long Size, DateTime Modified)> _seen = new(StringComparer.Ordinal);
+
+        public TransferJob(bool upload, string localDir, string remoteDir, List<FsItem> items)
+        {
+            Upload = upload;
+            LocalDir = localDir;
+            RemoteDir = remoteDir;
+            Items = items;
+        }
+
+        /// <summary>Records a source file's size and timestamp the first time the job sees it;
+        /// later calls report whether it is still the same file.</summary>
+        public bool Unchanged(string path, long size, DateTime modified)
+        {
+            if (_seen.TryGetValue(path, out var was)) return was == (size, modified);
+            _seen[path] = (size, modified);
+            return true;
+        }
     }
 
     // -------------------- item model --------------------

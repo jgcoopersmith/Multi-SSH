@@ -130,6 +130,26 @@ public static class RemoteAuth
         }
     }
 
+    /// <summary>
+    /// Hard-closes a client's socket. On a link where the server has stopped answering,
+    /// SSH.NET's Disconnect()/Dispose() wait on it forever and the requests in flight never
+    /// complete; closing the socket underneath fails them at once. Best-effort, like
+    /// <see cref="ApplySocketOptions"/>.
+    /// </summary>
+    public static void AbortSocket(BaseClient client)
+    {
+        try
+        {
+            var session = SessionProp?.GetValue(client);
+            var field = session?.GetType().GetField("_socket", BindingFlags.NonPublic | BindingFlags.Instance);
+            if (field?.GetValue(session) is Socket socket) socket.Dispose();
+        }
+        catch
+        {
+            // Best-effort: the SSH.NET internal layout differs or the socket is gone.
+        }
+    }
+
     private static bool IsPassphraseProblem(Exception ex)
     {
         if (ex is SshPassPhraseNullOrEmptyException) return true;
