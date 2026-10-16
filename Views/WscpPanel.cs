@@ -212,6 +212,15 @@ public class WscpPanel : Grid
     /// <summary>Report a transient status line while keeping the connected (green) state.</summary>
     private void Status(string text) => Emit(ConnectionState.Connected, text);
 
+    /// <summary>An action found no live connection (never connected, or the link died while
+    /// idle). Shown as disconnected — not on the green connected strip — unless a connect is
+    /// already under way and about to report its own state.</summary>
+    private void NotConnected()
+    {
+        if (_connecting) return;
+        Emit(ConnectionState.Disconnected, "Not connected — click ⟳ Reconnect");
+    }
+
     /// <summary>Restore the steady "Connected — user@host" status line.</summary>
     private void StatusIdle() => Emit(ConnectionState.Connected, _connectedStatus);
 
@@ -258,7 +267,7 @@ public class WscpPanel : Grid
     private async Task DoAsync(string busyText, Action<SftpClient, CancellationToken> work,
         bool refreshRemote = true, bool refreshLocal = true, TransferJob? job = null)
     {
-        if (_sftp == null || !_sftp.IsConnected) { Status("Not connected"); return; }
+        if (_sftp == null || !_sftp.IsConnected) { NotConnected(); return; }
         if (_opRunning) { Status("Busy — wait for the current operation to finish"); return; }
         _opRunning = true;
         try
@@ -267,7 +276,7 @@ public class WscpPanel : Grid
             try
             {
                 var sftp = _sftp;
-                if (sftp == null || !sftp.IsConnected) { Status("Not connected"); return; }
+                if (sftp == null || !sftp.IsConnected) { NotConnected(); return; }
                 var ct = _cts.Token;
                 _lastResult = null;
                 if (job != null && ReferenceEquals(job, _interrupted)) _interrupted = null;   // resuming it now
@@ -321,13 +330,13 @@ public class WscpPanel : Grid
         // so every remote listing is serialised through _gate — the same lock that guards
         // operations. A plain refresh requested while an op is already running is dropped on
         // purpose: that op refreshes both panes when it finishes.
-        if (_sftp == null || !_sftp.IsConnected) { Status("Not connected"); return; }
+        if (_sftp == null || !_sftp.IsConnected) { NotConnected(); return; }
         if (waitForGate) await _gate.WaitAsync();
         else if (!_gate.Wait(0)) return;
         try
         {
             var sftp = _sftp;                   // capture: the pane may close and null the field
-            if (sftp == null || !sftp.IsConnected) { Status("Not connected"); return; }
+            if (sftp == null || !sftp.IsConnected) { NotConnected(); return; }
             Status("Refreshing…");
             var cwd = _remoteCwd;
             var list = await Task.Run(() => sftp.ListDirectory(cwd).ToList());

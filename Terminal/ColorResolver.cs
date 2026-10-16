@@ -9,7 +9,9 @@ public static class ColorResolver
 
     public static Color Resolve(int code, ColorScheme scheme, bool isForeground)
     {
-        if (code == Cell.Default)
+        // Default, or any other negative code: never index the palette with it — this runs in
+        // OnRender, where a throw becomes an error box on every redraw.
+        if (code < 0)
             return isForeground ? scheme.Foreground : scheme.Background;
 
         if (code >= Cell.TrueColorBase)

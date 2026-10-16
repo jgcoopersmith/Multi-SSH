@@ -225,8 +225,13 @@ public class AnsiParser
         int mode = ps[i + 1];
         if (mode == 5 && i + 2 < ps.Length)
         {
+            // Only 0..255 is a palette index; anything else (e.g. a garbled "38;5;-2") is
+            // ignored, as xterm does, rather than stored as a colour the renderer can't index.
             int idx = ps[i + 2];
-            if (isFg) _buf.SetFg(idx); else _buf.SetBg(idx);
+            if (idx is >= 0 and <= 255)
+            {
+                if (isFg) _buf.SetFg(idx); else _buf.SetBg(idx);
+            }
             return i + 2;
         }
         if (mode == 2 && i + 4 < ps.Length)

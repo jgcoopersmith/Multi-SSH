@@ -102,6 +102,7 @@ public abstract class InteractivePromptBackend : ITerminalBackend
 
     public void Send(byte[] data)
     {
+        if (_disposed) return;
         foreach (var b in data)
         {
             if (b is 0x0d or 0x0a)          // Enter
@@ -110,7 +111,10 @@ public abstract class InteractivePromptBackend : ITerminalBackend
                 var cmd = _line.ToString();
                 _line.Clear();
                 if (IsExit(cmd)) { Line("bye"); ExitSession(); return; }
-                _queue.Add(cmd);
+                // Dispose (on a background thread) completes and then disposes the queue; a
+                // keystroke racing it must be dropped, not thrown onto the UI thread.
+                try { _queue.Add(cmd); }
+                catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { return; }
             }
             else if (b is 0x7f or 0x08)     // Backspace / DEL
             {

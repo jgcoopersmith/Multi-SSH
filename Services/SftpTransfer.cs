@@ -10,7 +10,8 @@ namespace MultiSSH.Services;
 /// Restartable SFTP file copies for the WSCP file manager.
 /// <para>Downloads are written to "&lt;file&gt;.part", which replaces the target only once it is
 /// complete. A download cut off by a dropped link keeps its .part, and the next download of
-/// that file carries on from the end of it instead of starting over.</para>
+/// that file carries on from the end of it instead of starting over — unless the remote file
+/// has been modified since the .part was last written.</para>
 /// <para>Uploads write the remote file in place and can carry on from where an interrupted
 /// upload of the same file stopped.</para>
 /// </summary>
@@ -36,11 +37,17 @@ public static class SftpTransfer
 
     /// <summary>Download <paramref name="remotePath"/> to <paramref name="localPath"/> via its
     /// .part file. With <paramref name="resume"/>, an existing .part no longer than the remote
-    /// file is continued from its end; otherwise the download starts over.</summary>
+    /// file, and written since the remote file last changed, is continued from its end;
+    /// otherwise the download starts over.</summary>
     public static void Download(SftpClient sftp, string remotePath, string localPath, bool resume,
         Action<long, long> progress, CancellationToken ct)
     {
         var part = localPath + PartSuffix;
+        // A .part left from before the remote file was last modified holds the old version:
+        // appending the rest of the new one would silently produce a corrupt file.
+        if (resume && File.Exists(part)
+            && File.GetLastWriteTimeUtc(part) < sftp.GetAttributes(remotePath).LastWriteTimeUtc)
+            resume = false;
         using (var input = sftp.Open(remotePath, FileMode.Open, FileAccess.Read))
         using (var output = new FileStream(part, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read))
         {
