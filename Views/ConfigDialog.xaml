@@ -220,7 +220,8 @@
                     <!-- Low-level TCP -->
                     <TextBlock Text="Low-level TCP connection options" FontWeight="Bold" Margin="0,16,0,8"/>
                     <CheckBox x:Name="NoDelayChk" Content="Disable Nagle's algorithm (TCP_NODELAY option)" Margin="0,3" IsChecked="True"/>
-                    <CheckBox x:Name="SoKeepaliveChk" Content="Enable TCP keepalives (SO_KEEPALIVE option)" Margin="0,3"/>
+                    <CheckBox x:Name="SoKeepaliveChk" Content="TCP keepalives (SO_KEEPALIVE) — always on: a dead connection is reported within ~35 s"
+                              Margin="0,3" IsChecked="True" IsEnabled="False"/>
 
                     <!-- IP version -->
                     <TextBlock Text="Internet protocol version" FontWeight="Bold" Margin="0,16,0,8"/>

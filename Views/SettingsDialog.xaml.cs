@@ -24,7 +24,7 @@ public partial class SettingsDialog : Window
 
         KeepAliveBox.Text = s.DefaultKeepAliveSeconds.ToString();
         ChkNoDelay.IsChecked = s.DefaultTcpNoDelay;
-        ChkSoKeepalive.IsChecked = s.DefaultSoKeepalive;
+        // ChkSoKeepalive stays checked: dead-connection keepalives are always on (RemoteAuth).
         (s.DefaultIpVersion switch
         {
             "IPv4" => RbIpv4,

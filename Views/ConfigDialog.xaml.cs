@@ -66,7 +66,7 @@ public partial class ConfigDialog : Window
         KeepAliveBox.Text = c.KeepAliveSeconds.ToString();
         TimeoutBox.Text = c.ConnectTimeoutSeconds.ToString();
         NoDelayChk.IsChecked = c.TcpNoDelay;
-        SoKeepaliveChk.IsChecked = c.SoKeepalive;
+        // SoKeepaliveChk stays checked: dead-connection keepalives are always on (RemoteAuth).
         (c.IpVersion switch
         {
             "IPv4" => RbIpv4,

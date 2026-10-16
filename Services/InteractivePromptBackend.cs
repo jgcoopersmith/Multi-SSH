@@ -32,7 +32,8 @@ public abstract class InteractivePromptBackend : ITerminalBackend
     private volatile bool _disposed;
     private readonly object _life = new();
     private bool _connectInFlight;   // guarded by _life
-    private bool _connected;
+    private volatile bool _connected;
+    private int _lost;
 
     protected InteractivePromptBackend(SessionConfig cfg) => Cfg = cfg;
 
@@ -111,6 +112,12 @@ public abstract class InteractivePromptBackend : ITerminalBackend
                 var cmd = _line.ToString();
                 _line.Clear();
                 if (IsExit(cmd)) { Line("bye"); ExitSession(); return; }
+                if (Volatile.Read(ref _lost) != 0)
+                {
+                    Line("connection lost — click ⟳ to reconnect");
+                    WritePrompt();
+                    continue;
+                }
                 // Dispose (on a background thread) completes and then disposes the queue; a
                 // keystroke racing it must be dropped, not thrown onto the UI thread.
                 try { _queue.Add(cmd); }
@@ -147,6 +154,16 @@ public abstract class InteractivePromptBackend : ITerminalBackend
     // ---- helpers for subclasses ----
 
     protected void Status(string s) => StatusChanged?.Invoke(s);
+
+    /// <summary>The transport died under a live session — SSH.NET reported a link error (a
+    /// silent drop is caught by the TCP keepalives RemoteAuth enables), or a WebDAV heartbeat
+    /// went unanswered. Reported once, any thread; later commands are refused.</summary>
+    protected void ConnectionLost(string? reason)
+    {
+        if (_disposed || !_connected || Interlocked.Exchange(ref _lost, 1) != 0) return;
+        _connected = false;
+        Closed?.Invoke("Connection lost" + (string.IsNullOrEmpty(reason) ? "" : ": " + reason));
+    }
     protected void WritePrompt() => Output(PromptText);
     protected void Line(string s = "") => Output(s + "\r\n");
 

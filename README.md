@@ -16,6 +16,10 @@ side-by-side in a grid that automatically resizes every pane to fit as you add m
   securely at connect time — and re-prompted on rejection — instead of the login
   simply failing
 - Per-session keepalive interval, connect timeout, TCP_NODELAY
+- Dead connections are noticed on every session type (SSH, SFTP, SCP, WSCP,
+  WebDAV), even when idle: a link that drops silently is reported within about
+  35 seconds — red status dot, red status strip, and a notice in the terminal —
+  so you know to click ⟳ Reconnect
 
 **Multiple sessions, your way**
 - **Tabbed view** — classic tabs, each with a close button

@@ -16,8 +16,9 @@ public class ScpConnection : InteractivePromptBackend
     protected override void ConnectClient()
     {
         _scp = new ScpClient(RemoteAuth.BuildConnectionInfo(Cfg), RemotePathTransformation.ShellQuote);
+        _scp.ErrorOccurred += (_, e) => ConnectionLost(RemoteAuth.DescribeLinkError(e.Exception));
         _scp.Connect();
-        RemoteAuth.ApplySocketOptions(_scp, Cfg);   // TCP_NODELAY / SO_KEEPALIVE
+        RemoteAuth.ApplySocketOptions(_scp, Cfg);   // TCP_NODELAY + dead-link keepalives
     }
 
     protected override void WriteWelcome()

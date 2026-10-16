@@ -9,8 +9,10 @@ using Renci.SshNet.Common;
 
 namespace MultiSSH.Views;
 
-/// <summary>Live connection state, surfaced as a coloured dot in pane/tab headers.</summary>
-public enum ConnectionState { Idle, Connecting, Connected, Disconnected, Failed }
+/// <summary>Live connection state, surfaced as a coloured dot in pane/tab headers.
+/// <see cref="Lost"/> is a live connection that died on its own (as opposed to
+/// <see cref="Disconnected"/>, which the user or the remote shell ended on purpose).</summary>
+public enum ConnectionState { Idle, Connecting, Connected, Disconnected, Failed, Lost }
 
 /// <summary>
 /// One live SSH session: a terminal plus a status strip, backed by an
@@ -53,7 +55,7 @@ public class SessionView : Grid
     {
         ConnectionState.Connected => Color.FromRgb(0x16, 0xC6, 0x0C),
         ConnectionState.Connecting => Color.FromRgb(0xE0, 0xA0, 0x30),
-        ConnectionState.Failed => Color.FromRgb(0xE7, 0x48, 0x56),
+        ConnectionState.Failed or ConnectionState.Lost => Color.FromRgb(0xE7, 0x48, 0x56),
         ConnectionState.Disconnected => Color.FromRgb(0x99, 0x99, 0x99),
         _ => Color.FromRgb(0x77, 0x77, 0x77),
     };
@@ -91,7 +93,7 @@ public class SessionView : Grid
     {
         ConnectionState.Connected => Color.FromRgb(0x1e, 0x3a, 0x1e),
         ConnectionState.Connecting => Color.FromRgb(0x3a, 0x33, 0x1e),
-        ConnectionState.Failed => Color.FromRgb(0x3a, 0x1e, 0x1e),
+        ConnectionState.Failed or ConnectionState.Lost => Color.FromRgb(0x3a, 0x1e, 0x1e),
         _ => Color.FromRgb(0x25, 0x25, 0x2b),
     };
 
@@ -356,7 +358,15 @@ public class SessionView : Grid
         backend.Closed += msg =>
         {
             if (!Current()) return;
-            if (_state != ConnectionState.Connecting)
+            // Closing or reconnecting detaches the backend before disposing it, so a Closed from
+            // the current one while connected means the connection died on its own: say so in
+            // red, in the strip and in the terminal, where the user is looking.
+            if (_state == ConnectionState.Connected)
+            {
+                SetState(ConnectionState.Lost, msg + " — click ⟳ to reconnect");
+                _term?.Feed(Enc($"\r\n\x1b[31m*** {msg} — click ⟳ to reconnect ***\x1b[0m\r\n"));
+            }
+            else if (_state != ConnectionState.Connecting)
                 SetState(ConnectionState.Disconnected, msg);
             Dispatcher.BeginInvoke(() => ConnectionClosed?.Invoke(this));
         };

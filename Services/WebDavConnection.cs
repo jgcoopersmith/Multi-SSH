@@ -16,6 +16,15 @@ public class WebDavConnection : InteractivePromptBackend
     private HttpClient? _http;
     private string _baseUrl = "";
     private string _cwd = "/";
+    private string _rootPath = "/";
+
+    // HTTP holds no standing connection whose death the OS could report, so a heartbeat asks
+    // the server every so often. Any HTTP answer — even an error status — proves the server is
+    // reachable; no answer within HeartbeatTimeout means the link is gone.
+    private Timer? _heartbeat;
+    private int _probing;
+    private static readonly TimeSpan HeartbeatEvery = TimeSpan.FromSeconds(RemoteAuth.DeadLinkIdleSeconds);
+    private static readonly TimeSpan HeartbeatTimeout = TimeSpan.FromSeconds(20);
 
     public WebDavConnection(SessionConfig cfg) : base(cfg) { }
 
@@ -37,6 +46,28 @@ public class WebDavConnection : InteractivePromptBackend
             throw new SshAuthenticationException("WebDAV authentication failed (401).");
         if (!resp.IsSuccessStatusCode)
             throw new Exception($"WebDAV connect failed: {(int)resp.StatusCode} {resp.ReasonPhrase}");
+
+        _rootPath = _cwd;
+        _heartbeat = new Timer(_ => Heartbeat(), null, HeartbeatEvery, HeartbeatEvery);
+    }
+
+    /// <summary>One liveness check (timer thread). Skipped while the previous one is still waiting.</summary>
+    private void Heartbeat()
+    {
+        var http = _http;
+        if (http == null || Interlocked.Exchange(ref _probing, 1) != 0) return;
+        try
+        {
+            using var cts = new CancellationTokenSource(HeartbeatTimeout);
+            using var resp = PropFind(http, _rootPath, "0", cts.Token);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
+        {
+            _heartbeat?.Dispose();
+            ConnectionLost(ex is OperationCanceledException ? "the server stopped answering" : RemoteAuth.DescribeLinkError(ex));
+        }
+        catch { /* client disposed: the session is closing */ }
+        finally { Volatile.Write(ref _probing, 0); }
     }
 
     /// <summary>Turn Host/Port into a base URL and initial path.</summary>
@@ -126,14 +157,16 @@ public class WebDavConnection : InteractivePromptBackend
         return trailing && result.Length > 1 ? result + "/" : result;
     }
 
-    private HttpResponseMessage PropFind(string path, string depth)
+    private HttpResponseMessage PropFind(string path, string depth) => PropFind(_http!, path, depth, default);
+
+    private HttpResponseMessage PropFind(HttpClient http, string path, string depth, CancellationToken ct)
     {
         var req = new HttpRequestMessage(new HttpMethod("PROPFIND"), _baseUrl + Encode(path));
         req.Headers.Add("Depth", depth);
         req.Content = new StringContent(
             "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\"><d:allprop/></d:propfind>",
             Encoding.UTF8, "application/xml");
-        return _http!.Send(req);
+        return http.Send(req, ct);
     }
 
     private void ListDir(string arg)
@@ -232,6 +265,8 @@ public class WebDavConnection : InteractivePromptBackend
 
     protected override void DisposeClient()
     {
+        _heartbeat?.Dispose();
+        _heartbeat = null;
         _http?.Dispose();
         _http = null;
     }

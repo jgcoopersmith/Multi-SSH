@@ -17,8 +17,9 @@ public class SftpConnection : InteractivePromptBackend
     protected override void ConnectClient()
     {
         _sftp = new SftpClient(RemoteAuth.BuildConnectionInfo(Cfg));
+        _sftp.ErrorOccurred += (_, e) => ConnectionLost(RemoteAuth.DescribeLinkError(e.Exception));
         _sftp.Connect();
-        RemoteAuth.ApplySocketOptions(_sftp, Cfg);   // TCP_NODELAY / SO_KEEPALIVE
+        RemoteAuth.ApplySocketOptions(_sftp, Cfg);   // TCP_NODELAY + dead-link keepalives
         _cwd = _sftp.WorkingDirectory;
     }
 

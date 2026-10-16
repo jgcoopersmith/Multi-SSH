@@ -107,11 +107,23 @@ public static class RemoteAuth
     private static readonly PropertyInfo? SessionProp =
         typeof(BaseClient).GetProperty("Session", BindingFlags.NonPublic | BindingFlags.Instance);
 
+    // Dead-connection detection. A link that dies silently (VPN or Wi-Fi drop, a suspended
+    // VM, a NAT that forgot the flow) sends nothing, so an idle session would look alive
+    // forever. TCP keepalive probes go out after this much silence; when this many in a row
+    // go unanswered the OS aborts the connection, SSH.NET raises ErrorOccurred, and the
+    // session reports "Connection lost" — about 15 + 4 × 5 = 35 s after the link went quiet.
+    public const int DeadLinkIdleSeconds = 15;
+    private const int DeadLinkProbeIntervalSeconds = 5;
+    private const int DeadLinkProbeCount = 4;
+    /// <summary>Same bound while data is waiting to be acknowledged (keepalives pause then).</summary>
+    private const int DeadLinkRetransmitSeconds = 35;
+    private const SocketOptionName TcpMaxRetransmitTime = (SocketOptionName)5;   // Windows TCP_MAXRT
+
     /// <summary>
-    /// Applies the low-level TCP options (TCP_NODELAY / SO_KEEPALIVE) to a connected
-    /// SSH.NET client's socket. SSH.NET exposes no public hook for these, so we reach
-    /// the socket by reflection — best-effort and non-fatal if the internals change.
-    /// Call only after the client has connected.
+    /// Applies the low-level TCP options to a connected SSH.NET client's socket: TCP_NODELAY
+    /// per the session, and always the keepalive timers that notice a dead link. SSH.NET
+    /// exposes no public hook for these, so we reach the socket by reflection — best-effort
+    /// and non-fatal if the internals change. Call only after the client has connected.
     /// </summary>
     public static void ApplySocketOptions(BaseClient client, SessionConfig cfg)
     {
@@ -122,12 +134,50 @@ public static class RemoteAuth
             if (field?.GetValue(session) is not Socket socket || !socket.Connected) return;
 
             socket.NoDelay = cfg.TcpNoDelay;
-            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, cfg.SoKeepalive);
+            EnableDeadLinkDetection(socket);
         }
         catch
         {
             // Best-effort: the SSH.NET internal layout differs or the socket is gone.
         }
+    }
+
+    /// <summary>A short reason for a dropped link, for the status strip and terminal notice.
+    /// Windows' own socket messages run to a paragraph ("A connection attempt failed because
+    /// the connected party did not properly respond after a period of time, or …").</summary>
+    public static string DescribeLinkError(Exception ex)
+    {
+        for (Exception? e = ex; e != null; e = e.InnerException)
+        {
+            if (e is SocketException se)
+                return se.SocketErrorCode switch
+                {
+                    SocketError.TimedOut => "the host stopped responding",
+                    SocketError.ConnectionReset => "the host reset the connection",
+                    SocketError.ConnectionAborted => "the connection was aborted",
+                    SocketError.ConnectionRefused => "the host refused the connection",
+                    SocketError.HostUnreachable or SocketError.NetworkUnreachable => "the host is unreachable",
+                    SocketError.NetworkDown => "the network is down",
+                    _ => se.Message,
+                };
+        }
+        return ex.Message;
+    }
+
+    /// <summary>Turn on TCP keepalives with short timers, and cap retransmission time, so the
+    /// OS aborts a connection whose peer has stopped answering. Each option is set on its own:
+    /// an older Windows that lacks one (e.g. the retry count) still gets the others.</summary>
+    public static void EnableDeadLinkDetection(Socket socket)
+    {
+        void Set(SocketOptionLevel level, SocketOptionName name, int value)
+        {
+            try { socket.SetSocketOption(level, name, value); } catch { /* unsupported here */ }
+        }
+        Set(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, 1);
+        Set(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, DeadLinkIdleSeconds);
+        Set(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, DeadLinkProbeIntervalSeconds);
+        Set(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, DeadLinkProbeCount);
+        Set(SocketOptionLevel.Tcp, TcpMaxRetransmitTime, DeadLinkRetransmitSeconds);
     }
 
     /// <summary>

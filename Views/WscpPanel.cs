@@ -30,6 +30,9 @@ public class WscpPanel : Grid
     private string _localCwd;
     private bool _connecting;
     private bool _shutdown;
+    /// <summary>Set when the current client's link is reported dead; cleared by the next
+    /// connect. Read from transfer threads (progress lines), hence volatile.</summary>
+    private volatile bool _linkLost;
     /// <summary>Serialises every request on the single SFTP channel (listings and operations).</summary>
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _opRunning;
@@ -134,9 +137,11 @@ public class WscpPanel : Grid
             {
                 await Task.Run(() =>
                 {
-                    client = new SftpClient(RemoteAuth.BuildConnectionInfo(_cfg));
-                    client.Connect();
-                    RemoteAuth.ApplySocketOptions(client, _cfg);
+                    var c = new SftpClient(RemoteAuth.BuildConnectionInfo(_cfg));
+                    client = c;
+                    c.ErrorOccurred += (_, e) => OnLinkLost(c, RemoteAuth.DescribeLinkError(e.Exception));
+                    c.Connect();
+                    RemoteAuth.ApplySocketOptions(c, _cfg);   // TCP_NODELAY + dead-link keepalives
                 });
 
                 if (_shutdown)
@@ -147,6 +152,7 @@ public class WscpPanel : Grid
                     return;
                 }
                 _cts = new CancellationTokenSource();
+                _linkLost = false;
                 _sftp = client;
                 _remoteCwd = _sftp!.WorkingDirectory;
                 _connectedStatus = $"Connected — {_cfg.Username}@{_cfg.Host}";
@@ -209,24 +215,42 @@ public class WscpPanel : Grid
     private void Emit(ConnectionState s, string text)
         => Dispatcher.Invoke(() => StateChanged?.Invoke(s, text));
 
-    /// <summary>Report a transient status line while keeping the connected (green) state.</summary>
-    private void Status(string text) => Emit(ConnectionState.Connected, text);
+    /// <summary>SSH.NET reported the link under <paramref name="client"/> dead (a silent drop is
+    /// caught by the TCP keepalives RemoteAuth enables). Shown at once, even with nothing
+    /// running, so an idle pane doesn't sit on a green strip over a dead connection.</summary>
+    private void OnLinkLost(SftpClient client, string reason)
+    {
+        // Raised on SSH.NET's listener thread: hop to the UI thread without blocking it.
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (_shutdown || _linkLost || !ReferenceEquals(client, _sftp)) return;
+            _linkLost = true;
+            Emit(ConnectionState.Lost, $"Connection lost: {reason} — click ⟳ Reconnect");
+        });
+    }
+
+    /// <summary>Report a transient status line while keeping the connected (green) state.
+    /// Suppressed once the link is known lost, so late progress can't repaint it green.</summary>
+    private void Status(string text)
+    {
+        if (!_linkLost) Emit(ConnectionState.Connected, text);
+    }
 
     /// <summary>An action found no live connection (never connected, or the link died while
     /// idle). Shown as disconnected — not on the green connected strip — unless a connect is
-    /// already under way and about to report its own state.</summary>
+    /// already under way, or the loss is already on screen with its reason.</summary>
     private void NotConnected()
     {
-        if (_connecting) return;
+        if (_connecting || _linkLost) return;
         Emit(ConnectionState.Disconnected, "Not connected — click ⟳ Reconnect");
     }
 
     /// <summary>Restore the steady "Connected — user@host" status line.</summary>
-    private void StatusIdle() => Emit(ConnectionState.Connected, _connectedStatus);
+    private void StatusIdle() => Status(_connectedStatus);
 
     /// <summary>Show the last operation's result if one is pending (so a transfer's
     /// completion notice survives the refresh that follows it), else the idle line.</summary>
-    private void Settle() => Emit(ConnectionState.Connected, _lastResult ?? _connectedStatus);
+    private void Settle() => Status(_lastResult ?? _connectedStatus);
 
     public void FocusDefault() => (_sftp != null ? _remoteList : _localList).Focus();
 
@@ -294,7 +318,8 @@ public class WscpPanel : Grid
                     _interrupted = job;
                     // Closing, or Reconnect already replaced the client and will resume the job.
                     if (_shutdown || !ReferenceEquals(sftp, _sftp)) return;
-                    Emit(ConnectionState.Disconnected, "Connection lost — transfer paused. Reconnect (⟳) to resume it.");
+                    _linkLost = true;
+                    Emit(ConnectionState.Lost, "Connection lost — transfer paused. Reconnect (⟳) to resume it.");
                     MessageBox.Show(Window.GetWindow(this),
                         $"Connection lost: {ex.Message}\n\nThe transfer is paused and the partial file is kept. " +
                         "Click ⟳ Reconnect to resume it from where it stopped.",

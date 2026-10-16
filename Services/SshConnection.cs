@@ -44,7 +44,7 @@ public class SshConnection : ITerminalBackend
         client.KeepAliveInterval = _cfg.KeepAliveSeconds > 0
             ? TimeSpan.FromSeconds(_cfg.KeepAliveSeconds)
             : Timeout.InfiniteTimeSpan;
-        client.ErrorOccurred += (_, e) => ConnectionLost(e.Exception.Message);
+        client.ErrorOccurred += (_, e) => ConnectionLost(RemoteAuth.DescribeLinkError(e.Exception));
 
         lock (_life)
         {
@@ -70,7 +70,7 @@ public class SshConnection : ITerminalBackend
             DisposeQuietly(client);
             throw new ObjectDisposedException(nameof(SshConnection));
         }
-        RemoteAuth.ApplySocketOptions(client, _cfg);   // TCP_NODELAY / SO_KEEPALIVE
+        RemoteAuth.ApplySocketOptions(client, _cfg);   // TCP_NODELAY + dead-link keepalives
 
         StatusChanged?.Invoke($"Connected — {_cfg.Username}@{_cfg.Host}");
 
@@ -101,7 +101,7 @@ public class SshConnection : ITerminalBackend
             _shell = shell;
         }
 
-        shell.ErrorOccurred += (_, e) => ConnectionLost(e.Exception.Message);
+        shell.ErrorOccurred += (_, e) => ConnectionLost(RemoteAuth.DescribeLinkError(e.Exception));
 
         // Read on a background thread: a blocking Read returns 0 at EOF when the
         // remote shell exits, which lets us tear the window down automatically.
@@ -128,7 +128,7 @@ public class SshConnection : ITerminalBackend
         }
         catch (Exception ex)
         {
-            failure = ex.Message;
+            failure = RemoteAuth.DescribeLinkError(ex);
         }
         finally
         {
@@ -176,7 +176,8 @@ public class SshConnection : ITerminalBackend
 
     public void Send(byte[] data)
     {
-        if (_shell == null) return;
+        // After a lost link, keystrokes would only replace "Connection lost" with "Send failed".
+        if (_shell == null || _connectionError) return;
         try
         {
             _shell.Write(data, 0, data.Length);
