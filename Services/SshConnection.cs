@@ -1,5 +1,4 @@
 using System.IO;
-using System.Reflection;
 using MultiSSH.Models;
 using Renci.SshNet;
 using Renci.SshNet.Common;
@@ -35,9 +34,9 @@ public class SshConnection : ITerminalBackend
 
     public async Task ConnectAsync(int cols, int rows)
     {
-        StatusChanged?.Invoke($"Connecting to {_cfg.Host}:{_cfg.Port} …");
+        StatusChanged?.Invoke($"Connecting to {_cfg.Host}:{_cfg.Port} â€¦");
 
-        // Build the connection info off the UI thread — resolving a forced IPv4/IPv6
+        // Build the connection info off the UI thread â€” resolving a forced IPv4/IPv6
         // host does a DNS lookup, which we don't want to block the UI with.
         var info = await Task.Run(() => RemoteAuth.BuildConnectionInfo(_cfg));
 
@@ -55,8 +54,8 @@ public class SshConnection : ITerminalBackend
             _connectInFlight = true;
         }
 
-        // Dispose leaves the client alone while Connect runs — tearing an SSH.NET client down
-        // mid-Connect leaks the session it is still building — so clean it up here instead.
+        // Dispose leaves the client alone while Connect runs â€” tearing an SSH.NET client down
+        // mid-Connect leaks the session it is still building â€” so clean it up here instead.
         bool disposed;
         try { await Task.Run(() => client.Connect()); }
         catch
@@ -73,7 +72,7 @@ public class SshConnection : ITerminalBackend
         }
         RemoteAuth.ApplySocketOptions(client, _cfg);   // TCP_NODELAY / SO_KEEPALIVE
 
-        StatusChanged?.Invoke($"Connected — {_cfg.Username}@{_cfg.Host}");
+        StatusChanged?.Invoke($"Connected â€” {_cfg.Username}@{_cfg.Host}");
 
         var modes = new Dictionary<Renci.SshNet.Common.TerminalModes, uint>();
         _shell = client.CreateShellStream(
@@ -101,7 +100,7 @@ public class SshConnection : ITerminalBackend
             while (!_disposed && shell != null)
             {
                 int n = shell.Read(buf, 0, buf.Length);
-                if (n <= 0) break; // EOF — the channel closed
+                if (n <= 0) break; // EOF â€” the channel closed
                 var slice = new byte[n];
                 Array.Copy(buf, slice, n);
                 DataReceived?.Invoke(slice);
@@ -113,7 +112,7 @@ public class SshConnection : ITerminalBackend
         }
         finally
         {
-            // Nothing may escape this background thread — an unhandled exception here would
+            // Nothing may escape this background thread â€” an unhandled exception here would
             // terminate the whole app (e.g. IsConnected throws if Dispose runs concurrently).
             try
             {
@@ -133,7 +132,7 @@ public class SshConnection : ITerminalBackend
                     }
                 }
             }
-            catch { /* disposed concurrently — the pane is closing anyway */ }
+            catch { /* disposed concurrently â€” the pane is closing anyway */ }
         }
     }
 
@@ -144,7 +143,7 @@ public class SshConnection : ITerminalBackend
         if (_disposed || Interlocked.Exchange(ref _lostRaised, 1) != 0) return;
         Closed?.Invoke("Connection lost" + (string.IsNullOrEmpty(reason) ? "" : ": " + reason));
         // SSH.NET never completes a pending ShellStream.Read when the session dies, so the
-        // read thread would hang forever; disposing the stream wakes it. Off this thread —
+        // read thread would hang forever; disposing the stream wakes it. Off this thread â€”
         // this is SSH.NET's message-listener thread, and a channel close waits on it.
         var shell = _shell;
         if (shell != null) Task.Run(() => { try { shell.Dispose(); } catch { } });
@@ -171,24 +170,13 @@ public class SshConnection : ITerminalBackend
 
     public void Send(string text) => Send(System.Text.Encoding.UTF8.GetBytes(text));
 
-    /// <summary>
-    /// Best-effort PTY resize. SSH.NET doesn't expose window-change on ShellStream
-    /// publicly, so we reach the underlying channel via reflection.
-    /// </summary>
+    /// <summary>Best-effort PTY resize via ShellStream.ChangeWindowSize.</summary>
     public void Resize(int cols, int rows)
     {
         if (_shell == null) return;
         try
         {
-            var field = typeof(ShellStream).GetField("_channel",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            var channel = field?.GetValue(_shell);
-            var method = channel?.GetType().GetMethod("SendWindowChangeRequest",
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            method?.Invoke(channel, new object[]
-            {
-                (uint)cols, (uint)rows, (uint)(cols * 8), (uint)(rows * 16)
-            });
+            _shell.ChangeWindowSize((uint)cols, (uint)rows, (uint)(cols * 8), (uint)(rows * 16));
         }
         catch
         {
