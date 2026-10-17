@@ -1147,7 +1147,23 @@ public partial class MainWindow : Window
             Cursor = System.Windows.Input.Cursors.Hand,
         };
         close.Click += (_, _) => ClosePane(pane);
+
+        // Tabs hide the pane header, so the tab carries its own Reconnect.
+        var reconnect = new Button
+        {
+            Content = "⟳",
+            Width = 18, Height = 18,
+            Margin = new Thickness(8, 0, 0, 0),
+            Padding = new Thickness(0),
+            BorderThickness = new Thickness(0),
+            Background = Brushes.Transparent,
+            Cursor = System.Windows.Input.Cursors.Hand,
+            ToolTip = "Reconnect",
+        };
+        reconnect.Click += (_, _) => _ = pane.Session.ReconnectAsync();
+
         panel.Children.Add(title);
+        panel.Children.Add(reconnect);
         panel.Children.Add(close);
         return panel;
     }
