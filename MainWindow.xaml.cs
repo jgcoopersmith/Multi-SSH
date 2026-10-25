@@ -5,6 +5,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
 using MultiSSH.Models;
@@ -94,35 +95,29 @@ public partial class MainWindow : Window
             !(width >= 320) || !(height >= 240))
             return;
 
-        if (!IsReachableOnScreen(new Rect(left, top, width, height))) return;
-
         WindowStartupLocation = WindowStartupLocation.Manual;
         Left = left;
         Top = top;
         Width = width;
         Height = height;
-        if (s.WindowMaximized) WindowState = WindowState.Maximized;
+        // Maximize only after OnSourceInitialized has checked the restore rect:
+        // a window maximizes onto the monitor its restore rect is on.
+        _restoreMaximized = s.WindowMaximized;
     }
 
+    private bool _restoreMaximized;
+
     /// <summary>
-    /// True when enough of <paramref name="r"/> lands on a monitor for the user
-    /// to see and grab it. The virtual screen is the bounding box of every
-    /// display, so this also covers multi-monitor setups.
+    /// The window handle exists but nothing is on screen yet: check the real
+    /// rect against each monitor's work area (not the virtual-screen bounding
+    /// box, whose gaps between unevenly sized monitors are off-screen) and pull
+    /// the window onto a monitor before it is shown.
     /// </summary>
-    private static bool IsReachableOnScreen(Rect r)
+    protected override void OnSourceInitialized(EventArgs e)
     {
-        var screen = new Rect(
-            SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
-            SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
-
-        var visible = Rect.Intersect(r, screen);
-        if (visible.IsEmpty) return false;
-
-        // The title bar must be on-screen and tall enough to drag: a window
-        // pushed above the top edge can't be moved with the mouse at all.
-        if (r.Top < screen.Top) return false;
-
-        return visible.Width >= 120 && visible.Height >= 40;
+        base.OnSourceInitialized(e);
+        ScreenPlacement.EnsureWindowVisible(new WindowInteropHelper(this).Handle);
+        if (_restoreMaximized) WindowState = WindowState.Maximized;
     }
 
     /// <summary>Copy the current placement into settings (without writing to disk).</summary>
