@@ -189,6 +189,8 @@
                                   ToolTip="Group this connection under a folder (e.g. Client A/Prod). Blank = top level."/>
                     </Grid>
                     <TextBlock x:Name="KindHint" Margin="0,14,0,4" Text="Connection type: SSH (port 22)" Foreground="#555"/>
+                    <CheckBox x:Name="RunAsAdminChk" Content="Run as Administrator" Margin="0,6,0,0" Visibility="Collapsed"
+                              ToolTip="Start this PowerShell / CMD session elevated. Windows asks for UAC consent each time it opens."/>
                     <CheckBox x:Name="SaveChk" Content="Save this session to the sidebar" Margin="0,10,0,0" IsChecked="True"/>
                 </StackPanel>
 

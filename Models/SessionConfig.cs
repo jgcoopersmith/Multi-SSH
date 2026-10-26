@@ -93,6 +93,16 @@ public class SessionConfig
     public bool CopyOnSelect { get; set; } = true;
     public bool PasteOnRightClick { get; set; } = true;
 
+    /// <summary>PowerShell / CMD only: start the shell elevated (UAC prompt on open).</summary>
+    public bool RunAsAdmin { get; set; }
+
+    /// <summary>Kinds that can be started as Administrator.</summary>
+    public static bool CanRunAsAdmin(SessionKind k) => k is SessionKind.PowerShell or SessionKind.Cmd;
+
+    /// <summary>True when this session should actually start elevated.</summary>
+    [JsonIgnore]
+    public bool Elevated => RunAsAdmin && CanRunAsAdmin(Kind);
+
     /// <summary>True for a shell running on this machine rather than a remote connection.</summary>
     [JsonIgnore]
     public bool IsLocal => IsLocalKind(Kind);
@@ -133,8 +143,8 @@ public class SessionConfig
     public string KindBadgeText => KindBadge(Kind);
 
     [JsonIgnore]
-    public string Display => !string.IsNullOrWhiteSpace(Name) ? Name
-        : IsLocal ? LocalShellName
+    public string Display => !string.IsNullOrWhiteSpace(Name) ? Name + (Elevated ? " (Admin)" : "")
+        : IsLocal ? LocalShellName + (Elevated ? " (Admin)" : "")
         : string.IsNullOrWhiteSpace(Host) ? "(new session)"
         : $"{Username}@{Host}";
 

@@ -19,6 +19,15 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // The elevated helper for "Run as Administrator" sessions: no window, no
+        // settings, and no single-instance guard (the main instance is its parent).
+        if (e.Args.Length > 0 && e.Args[0] == ElevatedFrames.HelperArg)
+        {
+            int code = ElevatedShellHost.Run(e.Args);
+            Shutdown(code);
+            return;
+        }
+
         _instanceMutex = new Mutex(initiallyOwned: true, MutexName, out bool isFirstInstance);
         _showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEventName);
 

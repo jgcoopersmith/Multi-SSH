@@ -246,8 +246,9 @@
                         </Style>
                     </TreeView.ItemContainerStyle>
                     <TreeView.ContextMenu>
-                        <ContextMenu>
+                        <ContextMenu Opened="TreeMenu_Opened">
                             <MenuItem Header="Open" Click="MenuOpen_Click"/>
+                            <MenuItem x:Name="MenuOpenAdmin" Header="Open as Administrator" Click="MenuOpenAdmin_Click"/>
                             <MenuItem Header="Edit…" Click="MenuEdit_Click"/>
                             <MenuItem Header="Duplicate" Click="MenuDuplicate_Click"/>
                             <MenuItem Header="Remove" Click="MenuDelete_Click"/>

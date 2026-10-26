@@ -87,6 +87,7 @@ public partial class ConfigDialog : Window
         BellChk.IsChecked = c.BellEnabled;
         CopySelChk.IsChecked = c.CopyOnSelect;
         RightPasteChk.IsChecked = c.PasteOnRightClick;
+        RunAsAdminChk.IsChecked = c.RunAsAdmin;
         UpdateAuthFieldStates();
         UpdateKindFieldStates();
     }
@@ -129,6 +130,7 @@ public partial class ConfigDialog : Window
         HostBox.IsEnabled = PortBox.IsEnabled = remote;
         HostLabel.IsEnabled = PortLabel.IsEnabled = remote;
         PanelConnection.IsEnabled = PanelAuth.IsEnabled = remote;
+        RunAsAdminChk.Visibility = SessionConfig.CanRunAsAdmin(SelectedKind) ? Visibility.Visible : Visibility.Collapsed;
 
         HighlightKindIcon();
 
@@ -210,6 +212,7 @@ public partial class ConfigDialog : Window
             BellEnabled = BellChk.IsChecked == true,
             CopyOnSelect = CopySelChk.IsChecked == true,
             PasteOnRightClick = RightPasteChk.IsChecked == true,
+            RunAsAdmin = SessionConfig.CanRunAsAdmin(kind) && RunAsAdminChk.IsChecked == true,
             TcpNoDelay = NoDelayChk.IsChecked == true,
             SoKeepalive = SoKeepaliveChk.IsChecked == true,
             IpVersion =

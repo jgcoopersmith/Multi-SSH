@@ -313,16 +313,19 @@ public class SessionView : Grid
     /// </summary>
     private async Task StartLocalShellAsync(int cols, int rows)
     {
-        SetState(ConnectionState.Connecting, $"Starting {_cfg.LocalShellName} …");
+        string shell = _cfg.Elevated ? $"{_cfg.LocalShellName} (Admin)" : _cfg.LocalShellName;
+        SetState(ConnectionState.Connecting, _cfg.Elevated
+            ? $"Starting {shell} … approve the UAC prompt"
+            : $"Starting {shell} …");
 
-        var local = new LocalShellConnection(_cfg);
+        ITerminalBackend local = _cfg.Elevated ? new ElevatedShellConnection(_cfg) : new LocalShellConnection(_cfg);
         HookBackend(local);
         _conn = local;
 
         try
         {
             await local.ConnectAsync(cols, rows);
-            SetState(ConnectionState.Connected, $"{_cfg.LocalShellName} — local");
+            SetState(ConnectionState.Connected, $"{shell} — local");
         }
         catch (Exception ex)
         {

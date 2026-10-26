@@ -472,6 +472,23 @@ public partial class MainWindow : Window
         if (cfg != null) OpenSession(cfg.Clone());
     }
 
+    /// <summary>One-off elevated open of a saved PowerShell / CMD entry (the saved entry is unchanged).</summary>
+    private void MenuOpenAdmin_Click(object sender, RoutedEventArgs e)
+    {
+        var cfg = SelectedSaved();
+        if (cfg == null || !SessionConfig.CanRunAsAdmin(cfg.Kind)) return;
+        var c = cfg.Clone();
+        c.RunAsAdmin = true;
+        OpenSession(c);
+    }
+
+    private void TreeMenu_Opened(object sender, RoutedEventArgs e)
+    {
+        var cfg = SelectedSaved();
+        MenuOpenAdmin.Visibility = cfg != null && SessionConfig.CanRunAsAdmin(cfg.Kind)
+            ? Visibility.Visible : Visibility.Collapsed;
+    }
+
     private void MenuEdit_Click(object sender, RoutedEventArgs e)
     {
         var cfg = SelectedSaved();
@@ -491,7 +508,9 @@ public partial class MainWindow : Window
         var cfg = SelectedSaved();
         if (cfg == null) return;
         var copy = cfg.Clone();
-        copy.Name = (string.IsNullOrWhiteSpace(cfg.Name) ? cfg.Display : cfg.Name) + " (copy)";
+        // LocalShellName, not Display: Display already carries the " (Admin)" suffix.
+        copy.Name = (string.IsNullOrWhiteSpace(cfg.Name)
+            ? (cfg.IsLocal ? cfg.LocalShellName : cfg.Display) : cfg.Name) + " (copy)";
         _saved.Add(copy);
         PersistSaved();
         RefreshTree();
